@@ -106,8 +106,31 @@ HttpResponse AGI_API::handle_chat(const HttpRequest& req) {
     size_t msg_pos = req.body.find("\"message\":");
     if (msg_pos != std::string::npos) {
         size_t start = req.body.find('"', msg_pos + 10) + 1;
-        size_t end = req.body.find('"', start);
-        message = req.body.substr(start, end - start);
+        // Walk forward respecting backslash escapes
+        size_t end = start;
+        while (end < req.body.size()) {
+            if (req.body[end] == '\\') { end += 2; continue; }
+            if (req.body[end] == '"')  { break; }
+            ++end;
+        }
+        // Unescape the extracted substring
+        std::string raw = req.body.substr(start, end - start);
+        message.reserve(raw.size());
+        for (size_t i = 0; i < raw.size(); ++i) {
+            if (raw[i] == '\\' && i + 1 < raw.size()) {
+                ++i;
+                switch (raw[i]) {
+                    case '"':  message += '"';  break;
+                    case '\\': message += '\\'; break;
+                    case 'n':  message += '\n'; break;
+                    case 'r':  message += '\r'; break;
+                    case 't':  message += '\t'; break;
+                    default:   message += raw[i]; break;
+                }
+            } else {
+                message += raw[i];
+            }
+        }
     }
     
     try {
@@ -179,7 +202,7 @@ canvas{display:block;position:fixed;inset:0}
   transition:filter 0.4s ease;
   pointer-events:none;
 }
-#logo.pulse{filter:brightness(2) drop-shadow(0 0 18px #fff);}
+
 #input-wrap{
   position:fixed;
   bottom:40px;
@@ -415,10 +438,7 @@ function speakValence(text, detectedValence){
     }
   }, stepTime);
 
-  // Logo pulse
-  const logo = document.getElementById('logo');
-  logo.classList.add('pulse');
-  setTimeout(()=>logo.classList.remove('pulse'), totalDuration*1000);
+
 }
 
 // ── Render loop ───────────────────────────────────────────────────────────
