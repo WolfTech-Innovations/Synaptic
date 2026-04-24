@@ -1,4 +1,4 @@
-# Synaptic
+# Synaptic - PCE; Proto-conciousness engine
 **WolfTech Innovations**
 
 Cognitive processing system. Single-binary C++23. Runs on Linux x86-64.
@@ -115,7 +115,7 @@ Synaptic is a single-file core (`main.cpp`) with a separate HTTP layer (`agi_api
 
 ### Theoretical Basis
 
-Internal weighting and integration metrics are derived from IIT (Integrated Information Theory), GWT (Global Workspace Theory), and HOT (Higher-Order Thought) frameworks. These inform the `phi` integration metric and `metacognitive_awareness` scalar but do not constitute claims of phenomenal experience.
+Internal weighting and integration metrics are derived from IIT (Integrated Information Theory), GWT (Global Workspace Theory), and HOT (Higher-Order Thought) frameworks. These inform the `phi` integration metric and `metacognitive_awareness` scalar
 
 ### State Schema (partial)
 
