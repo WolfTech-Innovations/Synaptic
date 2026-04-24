@@ -1,4 +1,5 @@
-# Synaptic - PCE; Proto-conciousness engine
+# Synaptic 
+# PCE; Proto-conciousness engine
 **WolfTech Innovations**
 
 Cognitive processing system. Single-binary C++23. Runs on Linux x86-64.
