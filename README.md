@@ -1,8 +1,8 @@
 # Synaptic 
-# PCE; Proto-conciousness engine
+# MPCE; Mathematical Proto-conciousness engine
 **WolfTech Innovations**
 
-Cognitive processing system. Single-binary C++23. Runs on Linux x86-64.
+Cognitive processing system. MSingle-binary C++23. Runs on Linux x86-64.
 
 ---
 
