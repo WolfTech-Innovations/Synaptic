@@ -463,8 +463,6 @@ const wrap = document.getElementById('input-wrap');
 setTimeout(()=>wrap.classList.add('visible'), 600);
 
 let busy = false;
-let lastValence = null;          // track previous valence to detect real change
-const VALENCE_THRESHOLD = 0.08; // minimum delta to trigger audio/visual response
 
 async function send(){
   if(busy) return;
@@ -492,17 +490,8 @@ async function send(){
 
     if(d.status==='ok'){
       const v = typeof d.valence === 'number' ? d.valence : 0;
-      const delta = lastValence === null ? Math.abs(v) : Math.abs(v - lastValence);
-
-      // Only fire audio+visual response if valence actually shifted meaningfully
-      if(delta >= VALENCE_THRESHOLD){
-        speakValence(d.response, v);
-        lastValence = v;
-      } else {
-        // Valence stable — tiny ripple only, no tone
-        waveAmplitude = 0.12;
-        setTimeout(()=>{ waveAmplitude = 0; }, 400);
-      }
+      speakValence(d.response, v);
+      lastValence = v;
     } else {
       speakValence('error', -0.5);
     }
