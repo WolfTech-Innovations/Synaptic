@@ -752,33 +752,65 @@ extern "C" double get_current_valence(){ return S.current_valence; }
 // deltas into a momentum buffer and bleed them into current_valence at a controlled
 // rate each tick. This means valence is always morphing but never snaps or locks.
 static double valence_momentum     = 0.0;  // accumulated pending delta
-static double valence_momentum_tau = 0.14; // momentum decay per tick (86% less inertia)
-static const double VALENCE_BLEED  = 0.78; // term impact: 78% of momentum bleeds into valence per tick
+static double valence_momentum_tau = 0.08; // momentum decay per tick — ~92% gone in 1 tick, no long snowball
+static const double VALENCE_BLEED  = 0.55; // momentum→valence transfer: enough to move freely, not enough to spike
+
+// ── Valence subsystem attenuation ────────────────────────────────────────────
+// Every system that pushes valence has only 2.3% effectiveness.
+// This constant is the single authoritative choke point — change here to tune.
+static constexpr double VALENCE_SUBSYSTEM_ATTENUATION = 0.023;
+
+// Hard gate: current_valence is NEVER allowed to reach ±1.0 (stuck/locked state).
+// Normal operation range is roughly ±0.90. The gate only fires in true runaway cases.
+static constexpr double VALENCE_HARD_MAX  = 0.97;  // hard ceiling — structurally unreachable zone
+static constexpr double VALENCE_SNAP_TO   = 0.88;  // snap target: still high, but not locked
+static constexpr double VALENCE_SAT_ONSET = 0.88;  // saturation pull starts here — leaves 0.86 fully free
+static constexpr double VALENCE_SAT_COEFF = 3.5;   // quadratic coefficient — firm but not crushing
 
 // All subsystems call this instead of writing current_valence directly.
 inline void push_valence(double delta, double strength = 1.0) {
-    valence_momentum += delta * strength;
+    // Apply 2.3% subsystem effectiveness — all external pushes are attenuated here.
+    valence_momentum += delta * strength * VALENCE_SUBSYSTEM_ATTENUATION;
     valence_momentum = max(-1.0, min(1.0, valence_momentum));
 }
 
 // Called once per main loop tick — bleeds momentum into current_valence.
 inline void tick_valence_momentum() {
     S.current_valence += valence_momentum * VALENCE_BLEED;
-    S.current_valence  = max(-1.0, min(1.0, S.current_valence));
     valence_momentum  *= valence_momentum_tau;
 
-    // ── Aggressive saturation decay filter ───────────────────────────────────
-    // Quadratic pull kicks in above ±0.85 — the closer to ±1 the harder it pulls.
-    // Makes true ceiling lock-in physically impossible under normal operation.
+    // ── HARD GATE PASS 1: snap anything at or beyond the ceiling ─────────────
+    // This only fires in true runaway — 0.86 is well below VALENCE_HARD_MAX (0.97).
+    if(S.current_valence >= VALENCE_HARD_MAX)
+        S.current_valence = VALENCE_SNAP_TO;
+    else if(S.current_valence <= -VALENCE_HARD_MAX)
+        S.current_valence = -VALENCE_SNAP_TO;
+
+    // ── Saturation pull — quadratic, only above ±0.88 ────────────────────────
+    // 0.86 is below onset so it sits there undisturbed.
+    // At 0.93 the pull is ~0.09× — meaningful but not instant collapse.
+    // At 0.97 it's ~0.30× — very strong, preventing true saturation lock.
     double abs_v = fabs(S.current_valence);
-    if(abs_v > 0.85) {
-        double overshoot = abs_v - 0.85;
-        double pull = overshoot * overshoot * 0.35;
+    if(abs_v > VALENCE_SAT_ONSET) {
+        double overshoot = abs_v - VALENCE_SAT_ONSET;
+        double pull      = overshoot * overshoot * VALENCE_SAT_COEFF;
+        pull             = min(pull, 0.40);  // cap — never more than 40% per tick
         S.current_valence *= (1.0 - pull);
     }
 
-    // Gentle mean-reversion toward 0 when nothing is pushing
-    S.current_valence *= 0.9999;
+    // ── Moderate mean-reversion — allows slow drift from 0.86 toward 0.1 ─────
+    // 0.9995 per tick → at 0.86 loses ~0.0004/tick naturally (slow, not forced).
+    // Systems pushing downward will dominate; this just ensures nothing freezes.
+    S.current_valence *= 0.9995;
+
+    // ── HARD GATE PASS 2: final insurance after all decay math ───────────────
+    if(S.current_valence >= VALENCE_HARD_MAX)
+        S.current_valence = VALENCE_SNAP_TO;
+    else if(S.current_valence <= -VALENCE_HARD_MAX)
+        S.current_valence = -VALENCE_SNAP_TO;
+
+    // Absolute safety clamp
+    S.current_valence = max(-1.0, min(1.0, S.current_valence));
 }
 
 // ── Vocal Affect Injection ────────────────────────────────────────────────────
@@ -11161,7 +11193,13 @@ void ld(const string& f) {
                 else if(l.find("DWT:") == 0 && l.size() > 4) S.dwt = uac(l.substr(4));
                 else if(l.find("TA:") == 0 && l.size() > 3) S.ta = uac(l.substr(3));
                 else if(l.find("SENTIENCE:") == 0 && l.size() > 10) S.sentience_ratio = uac(l.substr(10));
-                else if(l.find("VALENCE:") == 0 && l.size() > 8) S.current_valence = uac(l.substr(8));
+                else if(l.find("VALENCE:") == 0 && l.size() > 8) {
+                    double loaded_v = uac(l.substr(8));
+                    // Hard gate on load — snap any saved saturation back to the safe zone
+                    if(loaded_v >= VALENCE_HARD_MAX)  loaded_v = VALENCE_SNAP_TO;
+                    else if(loaded_v <= -VALENCE_HARD_MAX) loaded_v = -VALENCE_SNAP_TO;
+                    S.current_valence = loaded_v;
+                }
                 else if(l.find("METACOG:") == 0 && l.size() > 8) S.metacognitive_awareness = uac(l.substr(8));
                 else if(l.find("ATTENTION:") == 0 && l.size() > 10) S.attention_focus = uac(l.substr(10));
                 else if(l.find("PEAK_SENT_GEN:") == 0 && l.size() > 14) S.peak_sentience_gen = uac(l.substr(14));
