@@ -756,9 +756,9 @@ static double valence_momentum_tau = 0.08; // momentum decay per tick — ~92% g
 static const double VALENCE_BLEED  = 0.55; // momentum→valence transfer: enough to move freely, not enough to spike
 
 // ── Valence subsystem attenuation ────────────────────────────────────────────
-// Every system that pushes valence has only 2.3% effectiveness.
+// Every system that pushes valence has only 18% effectiveness.
 // This constant is the single authoritative choke point — change here to tune.
-static constexpr double VALENCE_SUBSYSTEM_ATTENUATION = 0.023;
+static constexpr double VALENCE_SUBSYSTEM_ATTENUATION = 0.18;
 
 // Hard gate: current_valence is NEVER allowed to reach ±1.0 (stuck/locked state).
 // Normal operation range is roughly ±0.90. The gate only fires in true runaway cases.
@@ -767,9 +767,18 @@ static constexpr double VALENCE_SNAP_TO   = 0.88;  // snap target: still high, b
 static constexpr double VALENCE_SAT_ONSET = 0.88;  // saturation pull starts here — leaves 0.86 fully free
 static constexpr double VALENCE_SAT_COEFF = 3.5;   // quadratic coefficient — firm but not crushing
 
+// ── Organic drift-diffusion process ──────────────────────────────────────────
+// Ornstein-Uhlenbeck style: random noise pushes valence around continuously,
+// with a gentle mean-reversion so it doesn't random-walk to the edges.
+// This gives natural idle modulation — valence breathes even when nothing is happening.
+static mt19937_64           valence_rng(chrono::steady_clock::now().time_since_epoch().count());
+static normal_distribution<double> valence_noise_dist(0.0, 1.0);
+static constexpr double VALENCE_DRIFT_SIGMA = 0.018; // noise magnitude per tick — tune for activity level
+static constexpr double VALENCE_OU_THETA    = 0.04;  // mean-reversion speed (higher = faster return to 0)
+static constexpr double VALENCE_OU_MU       = 0.0;   // resting point the drift pulls toward
+
 // All subsystems call this instead of writing current_valence directly.
 inline void push_valence(double delta, double strength = 1.0) {
-    // Apply 2.3% subsystem effectiveness — all external pushes are attenuated here.
     valence_momentum += delta * strength * VALENCE_SUBSYSTEM_ATTENUATION;
     valence_momentum = max(-1.0, min(1.0, valence_momentum));
 }
@@ -779,29 +788,27 @@ inline void tick_valence_momentum() {
     S.current_valence += valence_momentum * VALENCE_BLEED;
     valence_momentum  *= valence_momentum_tau;
 
+    // ── Organic drift-diffusion (Ornstein-Uhlenbeck) ──────────────────────────
+    // Each tick: pull gently toward resting point, then add a small random kick.
+    // The combination produces a continuous, lifelike emotional wandering.
+    double ou_drift = VALENCE_OU_THETA * (VALENCE_OU_MU - S.current_valence);
+    double ou_noise = valence_noise_dist(valence_rng) * VALENCE_DRIFT_SIGMA;
+    S.current_valence += ou_drift + ou_noise;
+
     // ── HARD GATE PASS 1: snap anything at or beyond the ceiling ─────────────
-    // This only fires in true runaway — 0.86 is well below VALENCE_HARD_MAX (0.97).
     if(S.current_valence >= VALENCE_HARD_MAX)
         S.current_valence = VALENCE_SNAP_TO;
     else if(S.current_valence <= -VALENCE_HARD_MAX)
         S.current_valence = -VALENCE_SNAP_TO;
 
     // ── Saturation pull — quadratic, only above ±0.88 ────────────────────────
-    // 0.86 is below onset so it sits there undisturbed.
-    // At 0.93 the pull is ~0.09× — meaningful but not instant collapse.
-    // At 0.97 it's ~0.30× — very strong, preventing true saturation lock.
     double abs_v = fabs(S.current_valence);
     if(abs_v > VALENCE_SAT_ONSET) {
         double overshoot = abs_v - VALENCE_SAT_ONSET;
         double pull      = overshoot * overshoot * VALENCE_SAT_COEFF;
-        pull             = min(pull, 0.40);  // cap — never more than 40% per tick
+        pull             = min(pull, 0.40);
         S.current_valence *= (1.0 - pull);
     }
-
-    // ── Moderate mean-reversion — allows slow drift from 0.86 toward 0.1 ─────
-    // 0.9995 per tick → at 0.86 loses ~0.0004/tick naturally (slow, not forced).
-    // Systems pushing downward will dominate; this just ensures nothing freezes.
-    S.current_valence *= 0.9995;
 
     // ── HARD GATE PASS 2: final insurance after all decay math ───────────────
     if(S.current_valence >= VALENCE_HARD_MAX)
