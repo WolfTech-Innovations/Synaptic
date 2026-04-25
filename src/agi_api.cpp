@@ -580,16 +580,115 @@ function render(ts){
 requestAnimationFrame(render);
 
 // ── Valence → emotion label ───────────────────────────────────────────────
+// ── Emotion ML classifier ─────────────────────────────────────────────────
+// Small feedforward neural net: input=[valence, valence^2, sin(v*π), cos(v*π)]
+// → hidden layer (8 neurons, tanh) → output layer (9 classes, softmax).
+// Weights are initialized from prior knowledge then updated online via
+// cross-entropy + SGD as valence history accumulates.
+
+const EMOTION_LABELS = [
+  "euphoric","joyful","content","calm","neutral","uneasy","melancholy","distressed","anguished"
+];
+const EM_IN  = 4;   // input features
+const EM_H   = 8;   // hidden neurons
+const EM_OUT = 9;   // output classes
+const EM_LR  = 0.04; // learning rate
+
+// Helper: random small weight
+const _rw = () => (Math.random() - 0.5) * 0.5;
+
+// Weights: W1[EM_H][EM_IN], b1[EM_H], W2[EM_OUT][EM_H], b2[EM_OUT]
+const emW1 = Array.from({length: EM_H},   () => Array.from({length: EM_IN},  _rw));
+const emb1 = Array.from({length: EM_H},   _rw);
+const emW2 = Array.from({length: EM_OUT}, () => Array.from({length: EM_H},   _rw));
+const emb2 = Array.from({length: EM_OUT}, _rw);
+
+// Seed W2 biases toward natural valence ordering so cold-start isn't random
+// euphoric→high valence ... anguished→low valence
+const EM_CENTERS = [0.9, 0.62, 0.38, 0.18, 0.0, -0.2, -0.42, -0.65, -0.9];
+EM_CENTERS.forEach((c, i) => { emb2[i] = c * 2; });
+
+function emFeatures(v) {
+  return [v, v * v * Math.sign(v), Math.sin(v * Math.PI), Math.cos(v * Math.PI)];
+}
+
+function emTanh(x) { return Math.tanh(x); }
+function emTanhD(x) { const t = Math.tanh(x); return 1 - t * t; }
+
+function emForward(v) {
+  const x = emFeatures(v);
+  // Hidden layer
+  const z1 = emb1.map((b, i) => b + emW1[i].reduce((s, w, j) => s + w * x[j], 0));
+  const h  = z1.map(emTanh);
+  // Output layer
+  const z2 = emb2.map((b, i) => b + emW2[i].reduce((s, w, j) => s + w * h[j], 0));
+  // Softmax
+  const maxZ = Math.max(...z2);
+  const exp  = z2.map(z => Math.exp(z - maxZ));
+  const sumE = exp.reduce((a, b) => a + b, 0);
+  const prob = exp.map(e => e / sumE);
+  return { x, z1, h, z2, prob };
+}
+
+// Online SGD step — target is the index of the "correct" emotion for this valence
+function emTrain(v, targetIdx) {
+  const { x, z1, h, prob } = emForward(v);
+
+  // Output delta (cross-entropy + softmax gradient)
+  const dz2 = prob.map((p, i) => p - (i === targetIdx ? 1 : 0));
+
+  // Backprop into hidden
+  const dh = Array(EM_H).fill(0);
+  for (let i = 0; i < EM_OUT; i++)
+    for (let j = 0; j < EM_H; j++)
+      dh[j] += dz2[i] * emW2[i][j];
+  const dz1 = dh.map((d, j) => d * emTanhD(z1[j]));
+
+  // Update W2, b2
+  for (let i = 0; i < EM_OUT; i++) {
+    emb2[i] -= EM_LR * dz2[i];
+    for (let j = 0; j < EM_H; j++)
+      emW2[i][j] -= EM_LR * dz2[i] * h[j];
+  }
+  // Update W1, b1
+  for (let j = 0; j < EM_H; j++) {
+    emb1[j] -= EM_LR * dz1[j];
+    for (let k = 0; k < EM_IN; k++)
+      emW1[j][k] -= EM_LR * dz1[j] * x[k];
+  }
+}
+
+// Valence history buffer for online training signal
+const emHistory = [];
+const EM_HISTORY_MAX = 60;
+
+// Derive a soft training target from recent valence trajectory
+function emDeriveTarget(v) {
+  // Use the nearest center as the label — self-supervised from valence magnitude
+  let best = 0, bestD = Infinity;
+  EM_CENTERS.forEach((c, i) => {
+    const d = Math.abs(v - c);
+    if (d < bestD) { bestD = d; best = i; }
+  });
+  return best;
+}
+
 function valenceToEmotion(v) {
-  if      (v >  0.75) return "euphoric";
-  else if (v >  0.50) return "joyful";
-  else if (v >  0.30) return "content";
-  else if (v >  0.12) return "calm";
-  else if (v > -0.12) return "neutral";
-  else if (v > -0.30) return "uneasy";
-  else if (v > -0.50) return "melancholy";
-  else if (v > -0.75) return "distressed";
-  else                return "anguished";
+  // Log to history and do an online training step
+  emHistory.push(v);
+  if (emHistory.length > EM_HISTORY_MAX) emHistory.shift();
+
+  // Train on recent history sample (stochastic — pick one past point)
+  if (emHistory.length > 5) {
+    const sample = emHistory[Math.floor(Math.random() * emHistory.length)];
+    emTrain(sample, emDeriveTarget(sample));
+  }
+
+  // Infer
+  const { prob } = emForward(v);
+  let best = 0;
+  prob.forEach((p, i) => { if (p > prob[best]) best = i; });
+  return EMOTION_LABELS[best];
 }
 
 const lbl   = document.getElementById('valence-label');

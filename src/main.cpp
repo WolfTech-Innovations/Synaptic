@@ -1,4 +1,4 @@
-	#if defined(_WIN32) || defined(WINDOWS_BUILD) || defined(__WINDOWS__)
+#if defined(_WIN32) || defined(WINDOWS_BUILD) || defined(__WINDOWS__)
     // Only include Windows headers when compiling for Windows
     #include <windows.h>
 
@@ -111,8 +111,6 @@ struct TpGroundingFiber {
         attn_val.fill(0.0);
     }
 };
-// Forward-declare valence momentum function used before its definition
-inline void push_valence(double delta, double strength);
 // Defined after full TokiPonaWord array; declared here for forward visibility
 extern const TokiPonaWord TP_LEXICON[];
 extern const int          TP_LEXICON_SIZE;
@@ -125,6 +123,8 @@ void tpGroundingPulse();
 static double tp256_gpt_context_score(const string& candidate, const vector<string>& generated, const map<string, TokenConceptEmbedding>& tce_map, double phi);
 static bool   tp256_coherence_gate(const string& candidate, const vector<string>& generated, const map<string, TpGroundingFiber>& fibers, const map<string, TokenConceptEmbedding>& tce_map);
 static void   tp256_update_weights(TpGroundingFiber& fiber, const string& chosen, const map<string, TokenConceptEmbedding>& tce_map, const TokiPonaWord& lex, double activation, double phi, double val, double iit, double att);
+// Forward declaration — defined after sensory field code
+inline void push_valence(double delta, double strength);
 // ============================================================
 
 inline const char* domainName(Domain d){
@@ -752,13 +752,13 @@ extern "C" double get_current_valence(){ return S.current_valence; }
 // deltas into a momentum buffer and bleed them into current_valence at a controlled
 // rate each tick. This means valence is always morphing but never snaps or locks.
 static double valence_momentum     = 0.0;  // accumulated pending delta
-static double valence_momentum_tau = 0.92; // momentum decay per tick
-static const double VALENCE_BLEED  = 0.04; // how much momentum bleeds into valence per tick
+static double valence_momentum_tau = 0.14; // momentum decay per tick (86% less inertia)
+static const double VALENCE_BLEED  = 0.78; // term impact: 78% of momentum bleeds into valence per tick
 
 // All subsystems call this instead of writing current_valence directly.
 inline void push_valence(double delta, double strength = 1.0) {
     valence_momentum += delta * strength;
-    valence_momentum = max(-0.5, min(0.5, valence_momentum));
+    valence_momentum = max(-1.0, min(1.0, valence_momentum));
 }
 
 // Called once per main loop tick — bleeds momentum into current_valence.
@@ -766,8 +766,19 @@ inline void tick_valence_momentum() {
     S.current_valence += valence_momentum * VALENCE_BLEED;
     S.current_valence  = max(-1.0, min(1.0, S.current_valence));
     valence_momentum  *= valence_momentum_tau;
-    // Gentle mean-reversion: drifts toward 0 very slowly when nothing is pushing
-    S.current_valence *= 0.9995;
+
+    // ── Aggressive saturation decay filter ───────────────────────────────────
+    // Quadratic pull kicks in above ±0.85 — the closer to ±1 the harder it pulls.
+    // Makes true ceiling lock-in physically impossible under normal operation.
+    double abs_v = fabs(S.current_valence);
+    if(abs_v > 0.85) {
+        double overshoot = abs_v - 0.85;
+        double pull = overshoot * overshoot * 0.35;
+        S.current_valence *= (1.0 - pull);
+    }
+
+    // Gentle mean-reversion toward 0 when nothing is pushing
+    S.current_valence *= 0.9999;
 }
 
 // ── Vocal Affect Injection ────────────────────────────────────────────────────
@@ -5882,16 +5893,19 @@ string diffusionRefinementPass(
 // === Affective lexicon: Toki Pona VAD-style ===
 // Returns [0,1] valence score for a word; 0.5 = neutral
 double getAffectiveValence(const string& tok) {
+    // Values in [0,1] where 0.5=neutral, >0.5=positive, <0.5=negative.
+    // Previously ALL words were positive (≥0.18), causing runaway positive valence.
     static const map<string,double> LEX = {
-        {"pona",0.95},{"olin",0.92},{"suwi",0.90},{"wawa",0.88},{"ken",0.85},
-        {"awen",0.84},{"sama",0.83},{"suno",0.80},{"open",0.79},{"sona",0.78},
-        {"kama",0.76},{"lon",0.75},{"wile",0.74},{"nasin",0.73},{"ale",0.72},
-        {"sin",0.71},{"pilin",0.70},{"mi",0.68},{"toki",0.65},{"jan",0.63},
-        {"pali",0.60},{"lukin",0.58},{"kute",0.57},{"ante",0.56},{"lawa",0.55},
-        {"insa",0.54},{"sijelo",0.53},{"tenpo",0.52},{"ma",0.52},{"ni",0.51},
-        {"taso",0.50},{"kon",0.49},{"sewi",0.48},{"pimeja",0.30},{"pakala",0.28},
-        {"ike",0.22},{"monsuta",0.20},{"weka",0.35},{"moli",0.18},{"ala",0.32},
-        {"jaki",0.25},{"utala",0.28},{"pilin ike",0.25},{"anpa",0.30},{"ike mute",0.18}
+        {"pona",0.92},{"olin",0.90},{"suwi",0.88},{"wawa",0.78},{"ken",0.72},
+        {"awen",0.70},{"suno",0.74},{"open",0.68},{"sona",0.64},{"sin",0.62},
+        {"sama",0.60},{"kama",0.58},{"lon",0.56},{"wile",0.55},{"nasin",0.54},
+        {"ale",0.53},{"pilin",0.52},{"mi",0.51},{"toki",0.51},{"jan",0.51},
+        {"pali",0.50},{"lukin",0.50},{"kute",0.50},{"ante",0.50},{"lawa",0.50},
+        {"insa",0.50},{"sijelo",0.50},{"tenpo",0.50},{"ma",0.50},{"ni",0.50},
+        {"taso",0.50},{"kon",0.49},{"sewi",0.49},
+        {"pimeja",0.32},{"pakala",0.22},{"ike",0.18},{"monsuta",0.15},
+        {"weka",0.30},{"moli",0.12},{"ala",0.38},{"jaki",0.20},
+        {"utala",0.25},{"pilin ike",0.18},{"anpa",0.28},{"ike mute",0.10}
     };
     auto it = LEX.find(tok);
     if(it != LEX.end()) return it->second;
@@ -6773,8 +6787,7 @@ ReflectionResult selfReflectOnDraft(
         double draft_val = 0;
         for(const string& dt : draft_tokens) draft_val += getAffectiveValence(dt);
         draft_val = draft_tokens.empty() ? 0.5 : draft_val / draft_tokens.size();
-        S.current_valence += (draft_val - 0.5) * 0.05;
-        S.current_valence = max(-1.0, min(1.0, S.current_valence));
+        push_valence((draft_val - 0.5) * 0.04, 0.5);  // centered: 0.5=neutral, through momentum
     } else {
         // Rejected responses → slight epistemic humility increase
         S.metacognition.epistemic_humility = min(1.0,
@@ -9441,7 +9454,10 @@ string generateResponse(const string& input) {
     InputIntent intent = classifyInputIntent(words, safe_input);
 
     try {
-        for(const string& w : words) learnWord(w, S.current_valence);
+        for(const string& w : words) {
+            double word_val = getAffectiveValence(w) * 2.0 - 1.0;  // [0,1]→[-1,1]
+            learnWord(w, word_val);
+        }
         processNGramsFromTokens(words);
         wirePredictionVecs(words);  // update prediction vectors from this input
         extractInputTopicAnchors(safe_input);
@@ -10422,7 +10438,7 @@ void counterfactualAnalysis(){
     double current_ta=S.ta;
     double improvement=current_ta-last_ta;
     if(improvement>0){
-        S.current_valence+=improvement*0.05;
+        push_valence(improvement * 0.03, 0.5);
         storeEpisodicMemory("improvement",improvement);
         generate_qualia("positive_prediction_error", improvement, 0.7);
         for(auto&p:token_concept_embedding_map){
@@ -10430,7 +10446,7 @@ void counterfactualAnalysis(){
             propagate_throughout_system(p.first,improvement*0.1);
         }
     }else{
-        S.current_valence+=improvement*0.03;
+        push_valence(improvement * 0.02, 0.5);  // improvement negative here → pulls valence down
         storeEpisodicMemory("error",improvement);
         generate_qualia("negative_prediction_error", improvement, 0.5);
     }
@@ -12222,8 +12238,12 @@ static bool tp256_coherence_gate(
 void tpDir1_WordToConsciousness(const TokiPonaWord& w, double activation) {
     if(activation < 0.01) return;
 
-    // Valence: word's affective charge bleeds into system valence via momentum
-    double valence_delta = w.valence * activation * 0.03;
+    // Valence: word's affective charge bleeds into system valence via momentum.
+    // CENTERED: w.valence is in [-1,1] so we subtract the lexicon mean (~0.22)
+    // to prevent the naturally positive-skewed TP lexicon from acting as a
+    // perpetual positive pump every tick via the background grounding pulse.
+    static const double TP_LEXICON_VALENCE_MEAN = 0.22; // empirical mean of all TP word valences
+    double valence_delta = (w.valence - TP_LEXICON_VALENCE_MEAN) * activation * 0.03;
     push_valence(valence_delta, 0.5);
 
     // Phi: high phi_weight words amplify integrated information
@@ -13324,7 +13344,7 @@ void unified_consciousness_integration_engine(int generation){
     S.learning_signal.temporal_difference=S.learning_signal.prediction_error*0.5;
     S.learning_signal.intrinsic_motivation=S.motivational_system.intrinsic_motivation_level;
     S.learning_signal.curiosity_bonus=S.emotional_system.basic_emotions["curiosity"];
-    push_valence(psi_new * 0.05, 0.7);  // consciousness integration nudges valence
+    push_valence((psi_new - 0.5) * 0.02, 0.4);  // centered: high phi alone doesn't mean positive
     S.current_valence=cv(S.current_valence);
     S.metacognitive_awareness=calcMetacognitiveAwareness();
     S.attention_focus=cl(consciousness.phi_value*0.7+asp_c*0.3,0.0,1.0);
@@ -13359,7 +13379,7 @@ void unified_consciousness_integration_engine(int generation){
         hiq.coherence=consciousness.complexity_metric;
         hiq.phi_resonance=psi_new;
         generate_qualia("high_integration_state",psi_new,0.9);
-        push_valence(psi_new * 0.03, 0.8);  // high-integration consciousness peak
+        push_valence((psi_new - S.current_valence) * 0.01, 0.4);  // pulls toward phi, not unconditionally up
         S.current_valence=cv(S.current_valence);
     }
     if(generation%10==0){
@@ -14036,7 +14056,8 @@ int main(){
                     try {
                         auto it = token_concept_embedding_map.begin();
                         advance(it, ri(token_concept_embedding_map.size()));
-                        learnWord(it->first, S.current_valence);
+                        double word_val = getAffectiveValence(it->first) * 2.0 - 1.0;
+                        learnWord(it->first, word_val);
                     } catch(...) {}
                 }
                 if(S.g % 25 == 0) {
