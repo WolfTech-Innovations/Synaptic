@@ -1,4 +1,4 @@
-#if defined(_WIN32) || defined(WINDOWS_BUILD) || defined(__WINDOWS__)
+	#if defined(_WIN32) || defined(WINDOWS_BUILD) || defined(__WINDOWS__)
     // Only include Windows headers when compiling for Windows
     #include <windows.h>
 
@@ -111,6 +111,8 @@ struct TpGroundingFiber {
         attn_val.fill(0.0);
     }
 };
+// Forward-declare valence momentum function used before its definition
+inline void push_valence(double delta, double strength);
 // Defined after full TokiPonaWord array; declared here for forward visibility
 extern const TokiPonaWord TP_LEXICON[];
 extern const int          TP_LEXICON_SIZE;
@@ -564,8 +566,7 @@ static void sensory_field_tick() {
     // Modulate phi and valence by field (gentle: 2% blend)
     consciousness.phi_value = max(0.0, min(1.0,
         consciousness.phi_value * 0.98 + field_phi * 0.02));
-    S.current_valence = max(-1.0, min(1.0,
-        S.current_valence * 0.98 + field_val * 0.02));
+    push_valence((field_val - S.current_valence) * 0.02, 0.4);  // sensory field nudge
     // Entropy dimension feeds back into metacognitive awareness
     S.metacognitive_awareness = max(0.0, min(1.0,
         S.metacognitive_awareness * 0.97 + (1.0 - field_ent) * 0.03));
@@ -744,6 +745,37 @@ vector<double>valence_history;int peak_sentience_gen;string user_input,dialog_re
 State S,BK;
 // Accessor for agi_api — returns the live valence from the Synaptic engine
 extern "C" double get_current_valence(){ return S.current_valence; }
+
+// ── Valence Momentum System ───────────────────────────────────────────────────
+// Instead of every subsystem writing directly to S.current_valence (causing jitter
+// and getting "stuck" when many systems push in opposing directions), we accumulate
+// deltas into a momentum buffer and bleed them into current_valence at a controlled
+// rate each tick. This means valence is always morphing but never snaps or locks.
+static double valence_momentum     = 0.0;  // accumulated pending delta
+static double valence_momentum_tau = 0.92; // momentum decay per tick
+static const double VALENCE_BLEED  = 0.04; // how much momentum bleeds into valence per tick
+
+// All subsystems call this instead of writing current_valence directly.
+inline void push_valence(double delta, double strength = 1.0) {
+    valence_momentum += delta * strength;
+    valence_momentum = max(-0.5, min(0.5, valence_momentum));
+}
+
+// Called once per main loop tick — bleeds momentum into current_valence.
+inline void tick_valence_momentum() {
+    S.current_valence += valence_momentum * VALENCE_BLEED;
+    S.current_valence  = max(-1.0, min(1.0, S.current_valence));
+    valence_momentum  *= valence_momentum_tau;
+    // Gentle mean-reversion: drifts toward 0 very slowly when nothing is pushing
+    S.current_valence *= 0.9995;
+}
+
+// ── Vocal Affect Injection ────────────────────────────────────────────────────
+// Called by /api/affect when the frontend interprets vocal emotion from the user.
+// valence_delta in [-1, 1]: user's emotional tone bleeds into Synaptic's state.
+extern "C" void receive_vocal_affect(double valence_delta) {
+    push_valence(valence_delta * 0.35, 1.0);
+}
 WorkingMemory WM(32);
 map<string,TokenConceptEmbedding> token_concept_embedding_map;
 
@@ -8656,7 +8688,7 @@ string realizeSentencePlan(const SentencePlan& plan, const vector<double>& atten
             // Contextual activation: EMA toward 1.0 on use, decays each tick via global loop
             cit->second.contextual_activation = min(1.0, cit->second.contextual_activation * 0.95 + 0.15);
             double dv = (getAffectiveValence(chosen) - 0.5) * 0.03;
-            S.current_valence = max(-1.0, min(1.0, S.current_valence + dv));
+            push_valence(dv, 0.6);  // token affective charge via momentum
             generate_qualia(chosen, getAffectiveValence(chosen), cit->second.qualia_intensity);
             WM.add_token(chosen, cit->second.meaning);
             auto pit = token_concept_embedding_map.find(prev);
@@ -10146,9 +10178,8 @@ void harvestFork(ForkThought& fork) {
         }
     }
 
-    // Bidirectional: harvested fork's valence nudges system valence
-    S.current_valence = max(-1.0, min(1.0,
-        S.current_valence * 0.95 + fork.valence * 0.05));
+    // Bidirectional: harvested fork's valence nudges system valence via momentum
+    push_valence(fork.valence * 0.05, 0.5);
 
     // Write fork narrative to internal thoughts
     S.internal_thoughts.push_back(content);
@@ -12191,9 +12222,9 @@ static bool tp256_coherence_gate(
 void tpDir1_WordToConsciousness(const TokiPonaWord& w, double activation) {
     if(activation < 0.01) return;
 
-    // Valence: word's affective charge bleeds into system valence
+    // Valence: word's affective charge bleeds into system valence via momentum
     double valence_delta = w.valence * activation * 0.03;
-    S.current_valence = max(-1.0, min(1.0, S.current_valence + valence_delta));
+    push_valence(valence_delta, 0.5);
 
     // Phi: high phi_weight words amplify integrated information
     double phi_delta = w.phi_weight * activation * 0.02;
@@ -13293,7 +13324,7 @@ void unified_consciousness_integration_engine(int generation){
     S.learning_signal.temporal_difference=S.learning_signal.prediction_error*0.5;
     S.learning_signal.intrinsic_motivation=S.motivational_system.intrinsic_motivation_level;
     S.learning_signal.curiosity_bonus=S.emotional_system.basic_emotions["curiosity"];
-    S.current_valence=S.current_valence*0.95+psi_new*0.05;
+    push_valence(psi_new * 0.05, 0.7);  // consciousness integration nudges valence
     S.current_valence=cv(S.current_valence);
     S.metacognitive_awareness=calcMetacognitiveAwareness();
     S.attention_focus=cl(consciousness.phi_value*0.7+asp_c*0.3,0.0,1.0);
@@ -13328,7 +13359,7 @@ void unified_consciousness_integration_engine(int generation){
         hiq.coherence=consciousness.complexity_metric;
         hiq.phi_resonance=psi_new;
         generate_qualia("high_integration_state",psi_new,0.9);
-        S.current_valence+=psi_new*0.03;
+        push_valence(psi_new * 0.03, 0.8);  // high-integration consciousness peak
         S.current_valence=cv(S.current_valence);
     }
     if(generation%10==0){
@@ -13960,6 +13991,9 @@ int main(){
 
         while(running) {
             try {
+
+                // === VALENCE MOMENTUM TICK — must run first ===
+                tick_valence_momentum();
 
                 // === CORE PROCESSING UPDATES ===
                 try {

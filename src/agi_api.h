@@ -26,6 +26,7 @@ private:
     HttpResponse handle_memory(const HttpRequest& req);
     HttpResponse handle_goals(const HttpRequest& req);
     HttpResponse handle_valence(const HttpRequest& req);
+    HttpResponse handle_affect(const HttpRequest& req);
     HttpResponse handle_history(const HttpRequest& req);
     HttpResponse handle_save(const HttpRequest& req);
     HttpResponse handle_load(const HttpRequest& req);

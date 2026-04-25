@@ -6,13 +6,15 @@
 extern std::string generateResponse(const std::string& input);
 extern void sv(const std::string& filename);
 extern void ld(const std::string& filename);
-extern "C" double get_current_valence();  // returns S.current_valence from main.cpp
+extern "C" double get_current_valence();
+extern "C" void receive_vocal_affect(double valence_delta);
 
 AGI_API::AGI_API(int port) : server_(std::make_unique<WebServer>(port)) {
-    server_->register_route("POST", "/api/chat", [this](const HttpRequest& req) { return handle_chat(req); });
-    server_->register_route("POST", "/api/save", [this](const HttpRequest& req) { return handle_save(req); });
-    server_->register_route("POST", "/api/load", [this](const HttpRequest& req) { return handle_load(req); });
-    server_->register_route("GET", "/", [this](const HttpRequest& req) { return handle_ui(req); });
+    server_->register_route("POST", "/api/chat",   [this](const HttpRequest& req) { return handle_chat(req); });
+    server_->register_route("POST", "/api/affect",  [this](const HttpRequest& req) { return handle_affect(req); });
+    server_->register_route("POST", "/api/save",    [this](const HttpRequest& req) { return handle_save(req); });
+    server_->register_route("POST", "/api/load",    [this](const HttpRequest& req) { return handle_load(req); });
+    server_->register_route("GET",  "/",            [this](const HttpRequest& req) { return handle_ui(req); });
 }
 
 AGI_API::~AGI_API() { stop(); }
@@ -178,6 +180,97 @@ HttpResponse AGI_API::handle_load(const HttpRequest&) {
         resp.status_code = 500;
         resp.body = "{\"status\":\"error\",\"message\":\"" + json_escape(e.what()) + "\"}";
     }
+    return resp;
+}
+
+HttpResponse AGI_API::handle_affect(const HttpRequest& req) {
+    HttpResponse resp;
+    resp.status_code = 200;
+
+    // Parse JSON: {"words": ["happy","excited",...], "intensity": 0.8}
+    // Words are from Web Speech API transcript, intensity from RMS amplitude.
+    std::vector<std::string> words;
+    double intensity = 1.0;
+
+    // Extract words array
+    size_t wa = req.body.find("\"words\"");
+    if (wa != std::string::npos) {
+        size_t arr_start = req.body.find('[', wa);
+        size_t arr_end   = req.body.find(']', arr_start);
+        if (arr_start != std::string::npos && arr_end != std::string::npos) {
+            std::string arr = req.body.substr(arr_start + 1, arr_end - arr_start - 1);
+            size_t p = 0;
+            while (p < arr.size()) {
+                size_t q1 = arr.find('"', p);
+                if (q1 == std::string::npos) break;
+                size_t q2 = arr.find('"', q1 + 1);
+                if (q2 == std::string::npos) break;
+                words.push_back(arr.substr(q1 + 1, q2 - q1 - 1));
+                p = q2 + 1;
+            }
+        }
+    }
+
+    // Extract intensity
+    size_t ip = req.body.find("\"intensity\"");
+    if (ip != std::string::npos) {
+        size_t colon = req.body.find(':', ip);
+        if (colon != std::string::npos) {
+            try { intensity = std::stod(req.body.substr(colon + 1, 16)); }
+            catch (...) { intensity = 1.0; }
+            intensity = std::max(0.0, std::min(1.0, intensity));
+        }
+    }
+
+    // Simple affective lexicon — scores words [-1, 1]
+    // Positive, negative, and neutral affect words covering common speech
+    static const std::unordered_map<std::string, double> AFFECT_LEX = {
+        // Strong positive
+        {"love",0.95},{"amazing",0.92},{"wonderful",0.90},{"fantastic",0.90},
+        {"great",0.85},{"excellent",0.85},{"happy",0.85},{"joy",0.88},
+        {"excited",0.82},{"beautiful",0.88},{"perfect",0.90},{"awesome",0.87},
+        {"good",0.75},{"nice",0.70},{"fun",0.78},{"cool",0.72},{"yes",0.65},
+        {"thanks",0.70},{"thank",0.70},{"please",0.60},{"like",0.68},
+        {"enjoy",0.75},{"glad",0.78},{"hope",0.72},{"peace",0.80},
+        {"calm",0.72},{"safe",0.75},{"warm",0.74},{"light",0.65},
+        // Negative
+        {"hate",  -0.92},{"terrible",-0.90},{"awful",-0.88},{"horrible",-0.88},
+        {"bad",   -0.75},{"wrong",   -0.70},{"angry", -0.82},{"fear",   -0.80},
+        {"sad",   -0.78},{"upset",   -0.78},{"pain",  -0.80},{"hurt",   -0.78},
+        {"no",    -0.50},{"stop",    -0.55},{"don't", -0.50},{"never",  -0.55},
+        {"dark",  -0.45},{"cold",    -0.40},{"lost",  -0.55},{"broken", -0.70},
+        {"tired", -0.50},{"bored",   -0.45},{"boring",-0.48},{"fail",   -0.72},
+        {"failure",-0.78},{"dead",   -0.80},{"death", -0.82},{"cry",    -0.65},
+        {"crying",-0.68},{"scared",  -0.78},{"worry", -0.65},{"worried",-0.65},
+        {"stress",-0.70},{"confused",-0.55},{"alone", -0.65},{"empty",  -0.62},
+    };
+
+    // Score the words
+    double total = 0.0;
+    int count = 0;
+    for (const auto& w : words) {
+        std::string lower = w;
+        for (char& c : lower) c = std::tolower(c);
+        auto it = AFFECT_LEX.find(lower);
+        if (it != AFFECT_LEX.end()) {
+            total += it->second;
+            count++;
+        }
+    }
+
+    double valence_delta = 0.0;
+    if (count > 0) {
+        valence_delta = (total / count) * intensity;
+        valence_delta = std::max(-1.0, std::min(1.0, valence_delta));
+        receive_vocal_affect(valence_delta);
+    }
+
+    std::ostringstream oss;
+    oss << std::fixed << std::setprecision(4);
+    oss << "{\"status\":\"ok\",\"words_scored\":" << count
+        << ",\"valence_delta\":" << valence_delta
+        << ",\"current_valence\":" << get_current_valence() << "}";
+    resp.body = oss.str();
     return resp;
 }
 
@@ -508,6 +601,71 @@ function showValenceLabel(v) {
   const emotion = valenceToEmotion(v);
   lbl.textContent = "I'm . . . " + emotion;
   lbl.classList.add('visible');
+}
+
+// ── Speech Recognition (vocal affect) ────────────────────────────────────
+// Runs alongside the energy-based mic monitor. Web Speech API transcribes
+// what the user says; words are scored affectively and sent to /api/affect
+// so Synaptic's valence is shaped by the emotional tone of speech.
+let recognition = null;
+
+function startSpeechRecognition() {
+  const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+  if (!SR) return;  // browser doesn't support it — mic energy still works fine
+
+  recognition = new SR();
+  recognition.continuous    = true;
+  recognition.interimResults = false;
+  recognition.lang          = 'en-US';
+
+  recognition.onresult = (event) => {
+    for (let i = event.resultIndex; i < event.results.length; i++) {
+      if (!event.results[i].isFinal) continue;
+      const transcript = event.results[i][0].transcript.trim();
+      if (!transcript) continue;
+
+      const words = transcript.toLowerCase().split(/\s+/).filter(w => w.length > 1);
+      if (!words.length) return;
+
+      // Estimate intensity from current mic RMS if available, else default
+      const intensity = micAnalyser ? (() => {
+        const buf = new Uint8Array(micAnalyser.frequencyBinCount);
+        micAnalyser.getByteTimeDomainData(buf);
+        let sum = 0;
+        for (let j = 0; j < buf.length; j++) {
+          const s = (buf[j] - 128) / 128;
+          sum += s * s;
+        }
+        return Math.min(1.0, Math.sqrt(sum / buf.length) * 4.0);
+      })() : 0.7;
+
+      fetch('/api/affect', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({ words, intensity })
+      }).catch(() => {});  // silent fail — non-critical path
+
+      fetch('/api/chat', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({ message: transcript })
+      }).catch(() => {});  // fire and forget — feeds language generation
+    }
+  };
+
+  recognition.onerror = (e) => {
+    // 'no-speech' and 'aborted' are normal — just restart
+    if (e.error !== 'no-speech' && e.error !== 'aborted') return;
+  };
+
+  recognition.onend = () => {
+    // Auto-restart so it stays alive continuously
+    if (micActive) {
+      try { recognition.start(); } catch(_) {}
+    }
+  };
+
+  try { recognition.start(); } catch(_) {}
 }
 
 // ── Microphone listener ───────────────────────────────────────────────────
