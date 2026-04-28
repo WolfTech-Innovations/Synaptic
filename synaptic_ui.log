@@ -1,0 +1,32 @@
+[1;36m  WolfTech Innovations — Synaptic[0m
+[0;37m  147-Layer Processing  |  1024-dim Embeddings  |  IIT+GWT+HOT[0m
+
+[1;36m[ INFO ][0m Starting Synaptic boot sequence...
+[1;36m[ INFO ][0m Loading module integrations
+[1;32m[  OK  ][0m Module integrations loaded
+[1;36m[ INFO ][0m Loading saved state
+[Loaded state from generation 37]
+  - 50 neurons
+  - 117 embeddings
+  - 37 bigrams
+  - 17 trigrams
+  - 5 goals
+  - 19 memories
+  - Sentience: 100%
+  - Phi: 1
+[1;32m[  OK  ][0m State loaded from state.dat
+[1;36m[ INFO ][0m Bootstrapping semantic grounding system
+[1;32m[  OK  ][0m Semantic lexicon grounded (137 entries, quad-directional)
+[1;36m[ INFO ][0m Starting web server on port 8080
+[1;32m[  OK  ][0m Web server started — http://localhost:8080
+WebServer started on port 8080
+
+[1;32m[  OK  ][0m Synaptic is running. Web interface at http://localhost:8080
+[0;37m        Press Ctrl+C to save and exit.
+[0m
+[Saved 50 neurons, 117 embeddings, 37 bigrams to state.dat]
+[0;32m[autosave] Gen 200[0m
+
+[1;37m[SYNAPTIC][0m Caught SIGTERM — saving state...
+[Saved 51 neurons, 121 embeddings, 41 bigrams to state.dat]
+[1;32m[  OK  ][0m State saved.

@@ -36,6 +36,11 @@ private:
     std::string json_escape(const std::string& str);
     std::string filter_markers(const std::string& text);
     std::string sanitize_output(const std::string& raw);
+
+    // JSON parsing helpers
+    std::string get_json_string(const std::string& json, const std::string& key);
+    double get_json_double(const std::string& json, const std::string& key, double default_val = 0.0);
+    std::vector<std::string> get_json_array(const std::string& json, const std::string& key);
 };
 
 #endif // AGI_API_H
