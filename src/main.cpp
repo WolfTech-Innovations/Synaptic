@@ -413,6 +413,29 @@ namespace HB_RXR1 {
         NexusResult r = NEXUS_tick(state, 32, &psi_p, hist, hist_count, val_in, aro_in, &enc);
         last_res = r;
 
+        // Binaural Beat Generation based on reality consensus data
+        double P_theta = d_abs(r.eL);
+        double P_beta = d_abs(r.eH);
+        double REM_score = 0.0;
+        switch(S.current_rem_stage) {
+            case REMStage::AWAKE:         REM_score = 0.0; break;
+            case REMStage::LIGHT_SLEEP:   REM_score = 0.3; break;
+            case REMStage::DREAMING:      REM_score = 1.0; break;
+            case REMStage::CONSOLIDATING: REM_score = 0.8; break;
+            case REMStage::INTEGRATING:   REM_score = 0.5; break;
+        }
+
+        S.bb_target = 5.5 + (P_theta * 2.1) - (P_beta * 0.8);
+        double phi_t = P_theta / 1.0; // max_theta = 1.0
+        S.bb_amplitude = 0.04 + (REM_score * (0.12 - 0.04));
+
+        // Feed into encoded intent
+        Intent iv = target_to_intent(&current_target);
+        iv.phi = d_clamp(phi_t, 0.01, 1.0);
+        iv.omega = 2.0 * HB_PI * S.bb_target;
+        iv.tau = 1.0 - REM_score;
+        enc = ENCODE_INTENT(&iv);
+
         for(int i=0;i<32;i++){
             double push=r.IR*enc.fx*sin((double)(i+1)*HB_PHI+r.eH*HB_PI)
                        +r.IR*enc.fy*cos((double)(i+1)*HB_PHI*HB_PHI)
@@ -10668,13 +10691,6 @@ void tickForkThoughts() {
 // ============================================================
 
 const int REM_PERIOD = 200;   // generations between REM cycles
-int last_rem_gen = -REM_PERIOD;
-
-enum class REMStage {
-    AWAKE, LIGHT_SLEEP, DREAMING, CONSOLIDATING, INTEGRATING
-};
-REMStage current_rem_stage = REMStage::AWAKE;
-int rem_stage_timer = 0;      // gens remaining in current stage
 
 // Current dream state
 vector<NexusDreamFragment> current_dreams;
@@ -10682,8 +10698,8 @@ vector<NexusDreamFocus>    current_foci;
 
 // Should we enter REM now?
 bool shouldEnterREM() {
-    if(current_rem_stage != REMStage::AWAKE) return false;
-    if(S.g - last_rem_gen < REM_PERIOD) return false;
+    if(S.current_rem_stage != REMStage::AWAKE) return false;
+    if(S.g - S.last_rem_gen < REM_PERIOD) return false;
 
     // Trigger conditions: high phi + substantial memory
     bool phi_ready = consciousness.phi_value > 0.5;
@@ -10694,11 +10710,11 @@ bool shouldEnterREM() {
 // Run one tick of the REM cycle state machine
 // Returns a string describing current stage (for display)
 string tickREMCycle() {
-    if(current_rem_stage == REMStage::AWAKE) {
+    if(S.current_rem_stage == REMStage::AWAKE) {
         if(shouldEnterREM()) {
-            current_rem_stage = REMStage::LIGHT_SLEEP;
-            rem_stage_timer = 5;
-            last_rem_gen = S.g;
+            S.current_rem_stage = REMStage::LIGHT_SLEEP;
+            S.rem_stage_timer = 5;
+            S.last_rem_gen = S.g;
             return "[REM: entering light sleep]";
         }
         // Normal awake: just snapshot cognition matrix
@@ -10712,13 +10728,13 @@ string tickREMCycle() {
         return "";
     }
 
-    if(current_rem_stage == REMStage::LIGHT_SLEEP) {
+    if(S.current_rem_stage == REMStage::LIGHT_SLEEP) {
         snapshotCognitionMatrix();
         updateAssociationMatrix();
-        rem_stage_timer--;
-        if(rem_stage_timer <= 0) {
-            current_rem_stage = REMStage::DREAMING;
-            rem_stage_timer = 8;
+        S.rem_stage_timer--;
+        if(S.rem_stage_timer <= 0) {
+            S.current_rem_stage = REMStage::DREAMING;
+            S.rem_stage_timer = 8;
             // Build dream field and find foci
             buildDreamField();
             current_foci = findDreamFoci(5);
@@ -10734,10 +10750,10 @@ string tickREMCycle() {
         return "[REM: light sleep — associations settling]";
     }
 
-    if(current_rem_stage == REMStage::DREAMING) {
+    if(S.current_rem_stage == REMStage::DREAMING) {
         // Advance all fork thoughts during dream state
         tickForkThoughts();
-        rem_stage_timer--;
+        S.rem_stage_timer--;
 
         // Each dream tick: store one fragment as episodic memory
         if(!current_dreams.empty()) {
@@ -10762,15 +10778,15 @@ string tickREMCycle() {
             generate_qualia("dream", frag.valence, frag.coherence);
         }
 
-        if(rem_stage_timer <= 0) {
-            current_rem_stage = REMStage::CONSOLIDATING;
-            rem_stage_timer = 6;
+        if(S.rem_stage_timer <= 0) {
+            S.current_rem_stage = REMStage::CONSOLIDATING;
+            S.rem_stage_timer = 6;
         }
         string foci_str = current_foci.empty() ? "" : current_foci[0].focus_concept;
         return "[REM: dreaming — focus=" + foci_str + " forks=" + to_string(active_forks.size()) + "]";
     }
 
-    if(current_rem_stage == REMStage::CONSOLIDATING) {
+    if(S.current_rem_stage == REMStage::CONSOLIDATING) {
         // Sleep replay: strengthen well-consolidated memories, weaken weak ones
         // Also reverse Hebbian forgetting for significant memories
         replayMemoryConsolidation();
@@ -10793,15 +10809,15 @@ string tickREMCycle() {
                 [](const Memory& m){ return m.consolidation_strength < 0.05 && !m.is_semantic; }),
             S.episodic_memory.end());
 
-        rem_stage_timer--;
-        if(rem_stage_timer <= 0) {
-            current_rem_stage = REMStage::INTEGRATING;
-            rem_stage_timer = 4;
+        S.rem_stage_timer--;
+        if(S.rem_stage_timer <= 0) {
+            S.current_rem_stage = REMStage::INTEGRATING;
+            S.rem_stage_timer = 4;
         }
         return "[REM: consolidating — memories=" + to_string(S.episodic_memory.size()) + "]";
     }
 
-    if(current_rem_stage == REMStage::INTEGRATING) {
+    if(S.current_rem_stage == REMStage::INTEGRATING) {
         // Dream integration: update embeddings and concept links from dream fragments
         for(auto& frag : current_dreams) {
             if(frag.tokens.size() < 2) continue;
@@ -10843,9 +10859,9 @@ string tickREMCycle() {
         for(auto& fork : active_forks) harvestFork(fork);
         active_forks.clear();
 
-        rem_stage_timer--;
-        if(rem_stage_timer <= 0) {
-            current_rem_stage = REMStage::AWAKE;
+        S.rem_stage_timer--;
+        if(S.rem_stage_timer <= 0) {
+            S.current_rem_stage = REMStage::AWAKE;
             current_dreams.clear();
             current_foci.clear();
         }
@@ -11996,17 +12012,17 @@ int draw_ui(int /*unused*/) {
     {
         static const char* REM_NAMES[] = {
             "AWAKE", "LIGHT_SLEEP", "DREAMING", "CONSOLIDATING", "INTEGRATING"};
-        int ri2 = (int)current_rem_stage;
+        int ri2 = (int)S.current_rem_stage;
         const char* stage_name = (ri2 >= 0 && ri2 <= 4) ? REM_NAMES[ri2] : "UNKNOWN";
-        int cp = (current_rem_stage == REMStage::AWAKE) ? CP_GOOD :
-                 (current_rem_stage == REMStage::DREAMING) ? CP_ACCENT : CP_WARN;
+        int cp = (S.current_rem_stage == REMStage::AWAKE) ? CP_GOOD :
+                 (S.current_rem_stage == REMStage::DREAMING) ? CP_ACCENT : CP_WARN;
         char buf[256];
         snprintf(buf, sizeof(buf),
             "Stage:%-14s  Forks:%-3d  Dreams:%-3d  NextREM:%-5d  Memories:%-4lu",
             stage_name,
             (int)active_forks.size(),
             (int)current_dreams.size(),
-            max(0, (last_rem_gen + REM_PERIOD) - S.g),
+            max(0, (S.last_rem_gen + REM_PERIOD) - S.g),
             (unsigned long)S.episodic_memory.size());
         if(has_colors()) attron(COLOR_PAIR(cp));
         tui_print(row, buf); row++;
