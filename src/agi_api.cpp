@@ -7,7 +7,7 @@ extern std::string generateResponse(const std::string& input);
 extern void sv(const std::string& filename);
 extern void ld(const std::string& filename);
 extern "C" double get_current_valence();
-extern "C" void receive_vocal_affect(double valence_delta);
+extern "C" void receive_vocal_affect(double valence_delta, double intensity);
 
 AGI_API::AGI_API(int port) : server_(std::make_unique<WebServer>(port)) {
     server_->register_route("POST", "/api/chat",          [this](const HttpRequest& req) { return handle_chat(req); });
@@ -442,7 +442,7 @@ HttpResponse AGI_API::handle_affect(const HttpRequest& req) {
     if (count > 0) {
         valence_delta = (total / count) * intensity;
         valence_delta = std::max(-1.0, std::min(1.0, valence_delta));
-        receive_vocal_affect(valence_delta);
+        receive_vocal_affect(valence_delta, intensity);
     }
 
     std::ostringstream oss;
