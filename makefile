@@ -23,9 +23,9 @@ ifeq ($(TARGET_OS),windows)
     TRAIN_SCRIPT := download_corpus.bat
 else
     TARGET := $(OUTPUT_DIR)synaptic
-    CXX := clang++
-    CXXFLAGS := -std=c++23 -O3 -pthread -march=native
-    LDFLAGS := -lncurses -lm 
+    CXX := g++
+    CXXFLAGS := -std=c++23 -O3 -pthread -march=native -fopenmp
+    LDFLAGS := -lncurses -lm -fopenmp
     OBJ_EXT := .o
     PLATFORM_NAME := Linux (native)
     USE_ZIG := 0
