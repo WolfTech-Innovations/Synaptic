@@ -360,17 +360,50 @@ namespace HB_RXR1 {
 
     void update_target_from_text(const string& text) {
         if(text.empty() || text == ":") return;
-        strncpy(current_target.name, text.c_str(), 127);
+        string tname = text;
+        if(tname.size() > 60) tname = tname.substr(0, 57) + "...";
+        strncpy(current_target.name, tname.c_str(), 127);
+        string lower = text;
+        for(char &c : lower) c = tolower(c);
+
+        auto has = [&](const vector<string>& keys) {
+            for(const auto& k : keys) if(lower.find(k) != string::npos) return true;
+            return false;
+        };
+
+        // Extract physical parameters from STT description
+        double m = 0.3, s = 0.2, w = 0.5, tx = 0.3, d = 0.4, t = 0.3, sol = 0.9, p = 0.8;
+
+        if(has({"heavy","large","massive","big","weight","ton","huge"})) m += 0.4;
+        if(has({"light","small","tiny","little","feather","airy"})) m -= 0.2;
+        if(has({"huge","giant","large","big","enormous","colossal"})) s += 0.5;
+        if(has({"small","tiny","micro","mini","lili"})) s -= 0.1;
+        if(has({"red","hot","warm","fast","bright","active","high"})) w += 0.3;
+        if(has({"blue","cold","cool","slow","dark","deep","low"})) w -= 0.3;
+        if(has({"rough","coarse","sharp","complex","jagged","sand"})) tx += 0.4;
+        if(has({"smooth","soft","flat","simple","silk","glass"})) tx -= 0.2;
+        if(has({"dense","solid","thick","heavy","lead","compact"})) d += 0.3;
+        if(has({"hollow","thin","light","airy","vacuum","porous"})) d -= 0.2;
+        if(has({"hot","burning","warm","fire","lava","sun","seli"})) t += 0.5;
+        if(has({"cold","freezing","cool","ice","snow","lete","winter"})) t -= 0.2;
+        if(has({"hard","solid","rigid","stone","metal","steel","kiwen"})) sol += 0.1;
+        if(has({"soft","liquid","fluid","gas","cloud","telo","kon","mist"})) sol -= 0.6;
+        if(has({"near","close","here","inside","touch","poka"})) p += 0.1;
+        if(has({"far","distant","away","outside","beyond","monsi"})) p -= 0.6;
+
         size_t h = hash<string>{}(text);
         auto gv = [&](int salt) { return (double)((h ^ salt) % 1000) / 1000.0; };
-        current_target.mass_n = gv(0x123);
-        current_target.size_n = gv(0x456);
-        current_target.wavelength_n = gv(0x789);
-        current_target.texture_n = gv(0xabc);
-        current_target.density_n = gv(0xdef);
-        current_target.temp_n = gv(0xfed);
-        current_target.solidity_n = gv(0xcba);
-        current_target.proximity_n = gv(0x987);
+
+        // Blend keywords with hash signature
+        current_target.mass_n = d_clamp(m * 0.7 + gv(0x123) * 0.3, 0.0, 1.0);
+        current_target.size_n = d_clamp(s * 0.7 + gv(0x456) * 0.3, 0.0, 1.0);
+        current_target.wavelength_n = d_clamp(w * 0.7 + gv(0x789) * 0.3, 0.0, 1.0);
+        current_target.texture_n = d_clamp(tx * 0.7 + gv(0xabc) * 0.3, 0.0, 1.0);
+        current_target.density_n = d_clamp(d * 0.7 + gv(0xdef) * 0.3, 0.0, 1.0);
+        current_target.temp_n = d_clamp(t * 0.7 + gv(0xfed) * 0.3, 0.0, 1.0);
+        current_target.solidity_n = d_clamp(sol * 0.7 + gv(0xcba) * 0.3, 0.0, 1.0);
+        current_target.proximity_n = d_clamp(p * 0.7 + gv(0x987) * 0.3, 0.0, 1.0);
+
         Intent intent=target_to_intent(&current_target);
         enc=ENCODE_INTENT(&intent);
     }
@@ -1177,9 +1210,10 @@ inline void tick_valence_momentum() {
 // ── Vocal Affect Injection ────────────────────────────────────────────────────
 // Called by /api/affect when the frontend interprets vocal emotion from the user.
 // valence_delta in [-1, 1]: user's emotional tone bleeds into Synaptic's state.
-extern "C" void receive_vocal_affect(double valence_delta) {
+extern "C" void receive_vocal_affect(double valence_delta, double intensity) {
     push_valence(valence_delta * 0.35, 1.0);
     HB_RXR1::val_in = HB_RXR1::d_clamp(HB_RXR1::val_in + valence_delta * 0.1, -1.0, 1.0);
+    HB_RXR1::aro_in = HB_RXR1::d_clamp(HB_RXR1::aro_in + intensity * 0.2, 0.0, 1.0);
 }
 WorkingMemory WM(32);
 map<string,TokenConceptEmbedding> token_concept_embedding_map;
@@ -12056,15 +12090,24 @@ int draw_ui(int /*unused*/) {
     }
 
     // ── HB-RXR1 Reality Consensus Engine ──────────────────────────────────────
-    if(row < rows_avail - 8) {
+    if(row < rows_avail - 10) {
         tui_section(row, "HB-RXR1 Reality Consensus"); row++;
         char buf[256];
-        snprintf(buf, sizeof(buf), "  Target: %-20s  Pressure: %.4f%s",
-            HB_RXR1::current_target.name, HB_RXR1::coherence_pressure,
+        string tname = HB_RXR1::current_target.name;
+        if(tname.size() > 30) tname = tname.substr(0, 27) + "...";
+        snprintf(buf, sizeof(buf), "  Target: %-30s  Pressure: %.4f%s",
+            tname.c_str(), HB_RXR1::coherence_pressure,
             HB_RXR1::manifested ? "  !! OVERLOAD !!" : "");
         if(HB_RXR1::manifested) attron(COLOR_PAIR(CP_ALERT) | A_BOLD | A_BLINK);
         tui_print(row, buf); row++;
         if(HB_RXR1::manifested) attroff(COLOR_PAIR(CP_ALERT) | A_BOLD | A_BLINK);
+
+        snprintf(buf, sizeof(buf), "  Ma:%.2f Sz:%.2f Wl:%.2f Tx:%.2f De:%.2f Te:%.2f Sl:%.2f Px:%.2f",
+            HB_RXR1::current_target.mass_n, HB_RXR1::current_target.size_n,
+            HB_RXR1::current_target.wavelength_n, HB_RXR1::current_target.texture_n,
+            HB_RXR1::current_target.density_n, HB_RXR1::current_target.temp_n,
+            HB_RXR1::current_target.solidity_n, HB_RXR1::current_target.proximity_n);
+        tui_print(row, buf); row++;
 
         auto r = HB_RXR1::last_res;
         string l_bar = tui_bar((r.eL+1.0)/2.0, 15);
