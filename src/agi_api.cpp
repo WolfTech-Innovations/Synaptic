@@ -272,7 +272,9 @@ HttpResponse AGI_API::handle_status(const HttpRequest&) {
         << "\"attention\":" << S.attention_focus << ","
         << "\"memory_count\":" << S.episodic_memory.size() << ","
         << "\"neuron_count\":" << S.N.size() << ","
-        << "\"vocab_size\":" << token_concept_embedding_map.size()
+        << "\"vocab_size\":" << token_concept_embedding_map.size() << ","
+        << "\"bb_target\":" << S.bb_target << ","
+        << "\"bb_amplitude\":" << S.bb_amplitude
         << "}";
     resp.body = oss.str();
     return resp;
@@ -765,7 +767,58 @@ let audioCtx = null;
 function ensureAudio(){
   if(!audioCtx) audioCtx = new (window.AudioContext||window.webkitAudioContext)();
   if(audioCtx.state==='suspended') audioCtx.resume();
+  if(bbEngine) bbEngine.ensureStarted();
 }
+
+class BinauralBeatEngine {
+  constructor() {
+    this.started = false;
+    this.baseFreq = 200;
+    this.targetBeat = 0;
+    this.amplitude = 0;
+  }
+
+  ensureStarted() {
+    if(this.started || !audioCtx) return;
+    this.started = true;
+
+    this.merger = audioCtx.createChannelMerger(2);
+    this.gain = audioCtx.createGain();
+    this.gain.gain.value = 0;
+
+    this.oscL = audioCtx.createOscillator();
+    this.oscR = audioCtx.createOscillator();
+    this.oscL.type = 'sine';
+    this.oscR.type = 'sine';
+
+    this.pannerL = audioCtx.createPanner();
+    this.pannerR = audioCtx.createPanner();
+    this.pannerL.setPosition(-1, 0, 0);
+    this.pannerR.setPosition(1, 0, 0);
+
+    this.oscL.connect(this.pannerL);
+    this.oscR.connect(this.pannerR);
+    this.pannerL.connect(this.merger, 0, 0);
+    this.pannerR.connect(this.merger, 0, 1);
+    this.merger.connect(this.gain);
+    this.gain.connect(audioCtx.destination);
+
+    this.oscL.start();
+    this.oscR.start();
+    this.update(this.targetBeat, this.amplitude);
+  }
+
+  update(beat, amp) {
+    this.targetBeat = beat;
+    this.amplitude = amp;
+    if(!this.started) return;
+    const now = audioCtx.currentTime;
+    this.oscL.frequency.setTargetAtTime(this.baseFreq, now, 0.1);
+    this.oscR.frequency.setTargetAtTime(this.baseFreq + beat, now, 0.1);
+    this.gain.gain.setTargetAtTime(amp * 0.5, now, 0.1);
+  }
+}
+let bbEngine = new BinauralBeatEngine();
 
 // Valence → melodic scale mapping
 // Positive: major pentatonic (bright)
@@ -966,6 +1019,7 @@ async function updateDashboard() {
 
       // Update global valence for visualizer
       valence = d.valence;
+      if(bbEngine) bbEngine.update(d.bb_target || 0, d.bb_amplitude || 0);
     }
   } catch(e) {}
 }
