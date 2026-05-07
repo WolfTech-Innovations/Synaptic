@@ -49,6 +49,360 @@
 #include <arpa/inet.h>
 using namespace std;
 
+#ifdef _OPENMP
+  #include <omp.h>
+  #define HB_GET_TIME() omp_get_wtime()
+#else
+  #define HB_GET_TIME() ((double)clock()/(double)CLOCKS_PER_SEC)
+  static inline int omp_get_max_threads(void){return 1;}
+  static inline int omp_get_thread_num(void){return 0;}
+#endif
+
+// ══════════════════════════════════════════════════════════════════════════════
+// HB-RXR1 Reality Consensus Overload Engine — Integration
+// ══════════════════════════════════════════════════════════════════════════════
+namespace HB_RXR1 {
+    #define HB_PHI      1.6180339887
+    #define HB_PI       3.14159265358979323846
+    #define PINK_N   16
+    #define HIST_SIZE 512
+    #define MAX_STATE 64
+    #define MAX_OBS_HARD  65536
+    #define OVERLOAD_THRESHOLD 0.9999
+
+    static inline double d_min(double a,double b){return a<b?a:b;}
+    static inline double d_max(double a,double b){return a>b?a:b;}
+    static inline double d_clamp(double v,double lo,double hi){return d_max(lo,d_min(hi,v));}
+    static inline double d_abs(double x){return fabs(x);}
+    static inline double hb_safe_div(double a,double b){return d_abs(b)<1e-12?0.0:a/b;}
+    static inline double hb_act_sig(double x){return 1.0/(1.0+exp(-d_clamp(x,-20.0,20.0)));}
+    static inline double hb_act_gelu(double x){return 0.5*x*(1.0+tanh(sqrt(2.0/HB_PI)*(x+0.044715*x*x*x)));}
+    static inline double hb_act_swish(double x){return x*hb_act_sig(x);}
+    static inline double hb_act_mish(double x){return x*tanh(log(1.0+exp(d_clamp(x,-20.0,20.0))));}
+    static inline double hb_act_selu(double x){return x>0.0?1.0507*x:1.0507*1.67326*(exp(x)-1.0);}
+    static inline double hb_cv(double x){return d_clamp(x,-1.0,1.0);}
+
+    static long probe_free_ram_kb(void){
+        FILE *f=fopen("/proc/meminfo","r");
+        if(f){
+            char line[128];
+            while(fgets(line,sizeof(line),f)){
+                long kb=0;
+                if(sscanf(line,"MemAvailable: %ld kB",&kb)==1){
+                    fclose(f);
+                    return kb;
+                }
+            }
+            fclose(f);
+        }
+    #ifdef _SC_AVPHYS_PAGES
+        long pages=sysconf(_SC_AVPHYS_PAGES);
+        long page_sz=sysconf(_SC_PAGE_SIZE);
+        if(pages>0&&page_sz>0) return (pages*(page_sz/1024));
+    #endif
+        return 524288L;
+    }
+
+    static int probe_observer_count(int state_size){
+        int nthreads=omp_get_max_threads();
+        long free_kb=probe_free_ram_kb();
+        long reserve_kb=262144L;
+        long budget_kb=free_kb-reserve_kb;
+        if(budget_kb<1024) budget_kb=1024;
+        double obs_kb=(double)state_size*8.0/1024.0+0.125;
+        int n=(int)((double)budget_kb/obs_kb);
+        n=(n/nthreads)*nthreads;
+        if(n<nthreads) n=nthreads;
+        if(n>MAX_OBS_HARD) n=MAX_OBS_HARD;
+        return n;
+    }
+
+    typedef struct{const double *arr;int len;double scalar;int is_scalar;}PsiPrev;
+    static inline double pp_get(const PsiPrev *pp,int i){
+        if(pp->is_scalar||i<0||i>=pp->len)return 0.0;
+        return pp->arr[i];
+    }
+    static inline double pp_last(const PsiPrev *pp){
+        if(pp->is_scalar)return pp->scalar;
+        return pp->len>0?pp->arr[pp->len-1]:0.0;
+    }
+    static inline double pp_rev(const PsiPrev *pp,int i_lua){
+        if(pp->is_scalar)return 0.0;
+        int idx=pp->len-i_lua;
+        return(idx>=0&&idx<pp->len)?pp->arr[idx]:0.0;
+    }
+
+    typedef struct{
+        char name[128];
+        double mass_n,size_n,wavelength_n,texture_n;
+        double density_n,temp_n,solidity_n,proximity_n;
+    }Target;
+
+    typedef struct{double phi,omega,sigma,kappa,tau,rho,zeta;double vec[3];}Intent;
+
+    typedef struct{
+        double fx,fy,fz;
+        double strength,band_bias,temporal,basin,spread;
+        int valid;
+    }EncodedIntent;
+
+    static Intent target_to_intent(const Target *t){
+        Intent iv;
+        iv.phi=d_clamp(t->solidity_n,0.01,1.0);
+        iv.omega=2.0*HB_PI*t->wavelength_n;
+        iv.sigma=t->texture_n;
+        iv.kappa=t->density_n;
+        iv.tau=1.0-t->proximity_n;
+        iv.rho=t->size_n;
+        iv.zeta=0.0;
+        double vx=t->mass_n,vy=t->wavelength_n,vz=t->solidity_n;
+        double vm=sqrt(vx*vx+vy*vy+vz*vz)+1e-12;
+        iv.vec[0]=vx/vm;iv.vec[1]=vy/vm;iv.vec[2]=vz/vm;
+        return iv;
+    }
+
+    static EncodedIntent ENCODE_INTENT(const Intent *iv){
+        EncodedIntent e;memset(&e,0,sizeof(e));if(!iv)return e;
+        double phi_v=HB_PHI;
+        double ax=iv->vec[0]*iv->phi,ay=iv->vec[1]*iv->phi*phi_v,az=iv->vec[2]*iv->phi/phi_v;
+        double ox=ax*cos(iv->omega)-ay*sin(iv->omega);
+        double oy=ax*sin(iv->omega)+ay*cos(iv->omega);
+        double oz=az*exp(-iv->tau);
+        double fx=ox*exp(-iv->sigma*2.0)+iv->vec[0]*(1.0-iv->sigma);
+        double fy=oy*exp(-iv->sigma*2.0)+iv->vec[1]*(1.0-iv->sigma);
+        double fz=oz*exp(-iv->sigma*2.0)+iv->vec[2]*(1.0-iv->sigma);
+        double m=sqrt(fx*fx+fy*fy+fz*fz)+1e-12;
+        e.fx=fx/m;e.fy=fy/m;e.fz=fz/m;
+        e.strength=d_min(1.0,iv->rho*(1.0+iv->kappa)*d_abs(tanh(iv->omega)));
+        e.band_bias=iv->zeta;e.temporal=iv->tau;
+        e.basin=exp(-iv->kappa*2.0);e.spread=iv->sigma;e.valid=1;
+        return e;
+    }
+
+    typedef struct{double sample;double entropy;}NoiseResult;
+    static NoiseResult HB_NOISE(double t,double seed){
+        double phi_v=HB_PHI,pi_v=HB_PI;
+        double jitter=d_abs(sin(t*phi_v*1000.0+seed*pi_v))*0.5
+                     +(double)((long)(t*1000003.0)%997)/997.0*0.5
+                     +(double)clock()/(double)CLOCKS_PER_SEC*0.001;
+        double p[PINK_N];
+        unsigned long x=(unsigned long)(jitter*(double)(1<<24))&0xFFFFFFFFUL;
+        for(int k=0;k<PINK_N;k++){x=(x*1664525UL+1013904223UL)&0xFFFFFFFFUL;p[k]=((double)x/(double)(1UL<<32))*2.0-1.0;}
+        for(int oct=1;oct<=4;oct++){double amp=1.0/(double)(1<<oct),freq=(double)(1<<oct);for(int k=0;k<PINK_N;k++)p[k]+=amp*sin(t*freq*phi_v+(double)(k+1)*pi_v/8.0+jitter*pi_v);}
+        double mx=0.0;for(int k=0;k<PINK_N;k++)if(d_abs(p[k])>mx)mx=d_abs(p[k]);
+        for(int k=0;k<PINK_N;k++)p[k]/=(mx+1e-9);
+        double ht=fmod(t*phi_v*2.0*pi_v,2.0*pi_v),hz=d_max(0.0,1.0-t*0.02),hs=0.0;
+        for(int k=0;k<PINK_N;k++)hs+=p[k]*sin(ht+2.0*pi_v*(double)(k+1)/(double)PINK_N)*exp(-hz*(double)(k+1)*0.1);
+        hs/=(double)PINK_N;
+        double weave=1.0+0.3*sin(t*phi_v*7.0+ht);
+        double H=0.0;for(int k=0;k<PINK_N;k++)H-=p[k]*log(d_abs(p[k])+1e-9)*(1.0/(double)PINK_N);
+        H=d_clamp(H,0.0,1.0);
+        double lg=1.0+H*2.5*(1.0+0.5*sin(ht*phi_v));
+        NoiseResult r;r.sample=d_clamp(hs*weave*lg,-1.0,1.0);r.entropy=H;return r;
+    }
+
+    typedef struct{double eL,eM,eH,IR;}ObsResult;
+    static ObsResult run_observer(
+        const double *nst_o,int n,const PsiPrev *psi_prev,
+        const double *hist_arr,int hist_len,double val_in,double aro_in,
+        const EncodedIntent *enc,double obs_phase,double noise_sample,double noise_entropy)
+    {
+        double pi_v=HB_PI,phi_v=HB_PHI;
+        double mu=0.0;for(int i=0;i<n;i++)mu+=nst_o[i];mu/=(double)n;
+        double scale_n=(double)((n*31415)%9973+1)/1e7;
+        double Hc_s=0;for(int i=0;i<n;i++)Hc_s+=nst_o[i]*sin(nst_o[i]*phi_v)*scale_n;double Hc=hb_act_gelu(Hc_s);
+        double Rc_s=0;for(int i=0;i<n;i++)Rc_s+=nst_o[i]*cos(nst_o[i]*sqrt(2.0))*scale_n;double Rc=hb_act_swish(Rc_s);
+        double Ac_s=0;for(int i=0;i<n;i++)Ac_s+=nst_o[i]*tanh(nst_o[i]*sqrt(3.0))*pow(pi_v,sqrt(d_abs(nst_o[i])+0.1));double Ac=hb_act_mish(Ac_s);
+        double Mc_s=0;for(int i=0;i<n;i++)Mc_s+=nst_o[i]*sin(nst_o[i]*sqrt(5.0))/(d_abs(mu)+1.0)/10.0;double Mc=hb_act_selu(Mc_s);
+        double Oc_s=0;for(int i=0;i<n;i++)Oc_s+=nst_o[i]*cos(nst_o[i]*phi_v)*pow(1.5,-phi_v);double Oc=hb_act_gelu(Oc_s);
+        double Oc2=Oc_s;double Bc_s=0;for(int i=0;i<n;i++)Bc_s+=nst_o[i]*tanh(Oc2)*pow(pi_v,phi_v*0.5);double Bc=hb_act_swish(Bc_s);
+        double Fc_s=0;for(int i=0;i<n;i++)Fc_s+=nst_o[i]*pow(d_abs(mu)/1e6+0.001,phi_v*0.5);double Fc=hb_act_mish(Fc_s);
+        double Sc_b=Fc_s;double Sc_s=0;for(int i=0;i<n;i++)Sc_s+=nst_o[i]*Sc_b*sin(nst_o[i]*pi_v);double Sc=hb_act_selu(Sc_s);
+        double comb=Hc*Rc*Ac*Mc*Oc*Bc*Fc*Sc;
+        double ma_iit=0;for(int i=0;i<n;i++)ma_iit+=d_abs(nst_o[i]);ma_iit/=(double)n;
+        double IIT=tanh(0.1*pow(phi_v,3.0)*(ma_iit*(1.0-ma_iit)*5.0));
+        double ma_gwt=0;for(int i=0;i<n;i++)ma_gwt+=d_abs(nst_o[i]);ma_gwt/=(double)n;
+        double GWT=tanh(0.1*pow(phi_v,3.0)*ma_gwt*(1.0-ma_gwt));
+        double HOT=tanh(tanh(hb_cv(val_in)*hb_cv(aro_in)));double ASP=HOT;
+        double pe=0;{double mu2=0;for(int i=0;i<n;i++)mu2+=nst_o[i];mu2/=(double)n;double v2=0;for(int i=0;i<n;i++)v2+=(nst_o[i]-mu2)*(nst_o[i]-mu2);v2/=(double)n;for(int i=0;i<n;i++){double nm=(nst_o[i]-mu2)/sqrt(v2+1e-10);pe+=d_abs(nm)*exp(-(double)(i+1)*0.1);}}
+        double prec=0;{double mu2=0;for(int i=0;i<n;i++)mu2+=nst_o[i];mu2/=(double)n;double v2=0;for(int i=0;i<n;i++)v2+=(nst_o[i]-mu2)*(nst_o[i]-mu2);v2/=(double)n;for(int i=0;i<n;i++){double nm=(nst_o[i]-mu2)/sqrt(v2+1e-10);if(d_abs(nm)>1.5)prec+=nm*nm;}}
+        double pred=prec;
+        double fe=0;for(int i=0;i<n;i++)fe+=nst_o[i]*log(d_abs(nst_o[i])+0.001);fe=-(fe/(double)n);
+        double RPF=tanh(pe*prec*pred*fe);
+        double sup=0;for(int i=0;i<n;i++)sup+=(d_abs(nst_o[i])>mu)?hb_act_sig(nst_o[i]*2.0):0.0;
+        double top1=0,top2=0;for(int i=0;i<n;i++){double v=d_abs(nst_o[i]);if(v>top1){top2=top1;top1=v;}else if(v>top2)top2=v;}
+        double QC=tanh(sup*(top1-top2)/(top1+0.01));
+        double som=tanh(hb_cv(val_in)*hb_cv(aro_in));double aff=tanh(tanh(hb_cv(val_in)*hb_cv(aro_in)));double Emb=tanh(som*aff);
+        double rc=0;{int pp_len=psi_prev->is_scalar?0:psi_prev->len;int lim=n<pp_len?n:pp_len;for(int i=0;i<lim;i++)rc+=d_abs(pp_get(psi_prev,i)-nst_o[i])*exp(-(double)(i+1)*0.1);}
+        double sc_val=0;for(int i=0;i<n;i++){double pp_i=pp_get(psi_prev,i);sc_val+=exp(-d_abs(pp_i-nst_o[i]))*(1.0-d_abs(pp_i-nst_o[i]));}sc_val/=(double)n;
+        double Rib=tanh(rc*sc_val);
+        double dp_m=0;for(int i=0;i<n;i++)dp_m+=d_abs(nst_o[i]-pp_get(psi_prev,i));dp_m/=(double)n;
+        double TLoop=tanh(d_abs(dp_m-pp_last(psi_prev)));
+        double ffft_inner=0;for(int k=0;k<n;k++)ffft_inner+=nst_o[k]*cos(2.0*pi_v*(double)(k+1)/(double)n)*0.5+(double)((n*(k+1))%100)/100.0;
+        double gelu_fi=hb_act_gelu(ffft_inner);double A_ffft=0;for(int i=0;i<n;i++)for(int j=0;j<n;j++)A_ffft+=nst_o[i]*(double)(j+1)*gelu_fi;A_ffft/=((double)n*(double)n+1.0);double FFFT=hb_act_mish(A_ffft);
+        double UC=0.20*IIT+0.15*GWT+0.12*HOT+0.12*ASP+0.08*RPF+0.05*QC+0.05*Emb+0.05*RPF+0.10*Rib+0.05*TLoop+0.03*FFFT;
+        double rec_raw=0;for(int i=0;i<n;i++){int tau_i=i+1;rec_raw+=(double)(n-tau_i)*exp(-(double)(n-tau_i)/20.0)*fmod(nst_o[i]+2.0,4.0)+sin(2.0*pi_v*(double)tau_i/(double)n)*nst_o[i]*0.2;}rec_raw/=(double)n;
+        double rec=hb_act_mish(rec_raw);double temp_v=rec_raw;
+        int hw=hist_len<100?hist_len:100;double hist_val=0;for(int i=0;i<hw;i++)hist_val+=(hist_len>0?hist_arr[hist_len-1-i]:0.0)*exp(-0.05*(double)i);hist_val/=(double)(hw+1);
+        double integ_prod=1;for(int i=0;i<n-1;i++)integ_prod*=hb_act_swish(hb_safe_div(nst_o[i]+2.0,nst_o[i+1]+2.001)*0.5);
+        double ep=0;for(int i=0;i<n;i++)ep+=nst_o[i]*log(d_abs(nst_o[i])+0.001);ep=-(ep/(double)n);double integ=integ_prod*exp(-ep*0.3);
+        double rms_sq=0;for(int i=0;i<n;i++)rms_sq+=nst_o[i]*nst_o[i];rms_sq/=(double)n;double comp_rms=sqrt(rms_sq);
+        double dv_mu=0;for(int i=0;i<n;i++)dv_mu+=nst_o[i];dv_mu/=(double)n;double diff_var=0;for(int i=0;i<n;i++)diff_var+=(nst_o[i]-dv_mu)*(nst_o[i]-dv_mu);diff_var/=(double)n;
+        double pi_fac=pow(pi_v,pow(pi_v,sqrt(pi_v)));
+        double raw_psi=rec*integ*(temp_v*0.3+hist_val*0.7)*comb*UC*(1.0+comp_rms*0.3+diff_var*0.2)*pi_fac;
+        double delta=0;for(int i=0;i<n;i++){double a=d_abs(nst_o[i]);delta-=(a+0.001)*log(a+0.001);}delta=d_clamp(delta/(double)n,0.0,1.0);
+        double cbs=delta<0.25?8.0:(delta<0.65?11.5:15.0);
+        double eL_psi=d_clamp(raw_psi*(0.20*(0.20*IIT+0.15*GWT+0.12*HOT+0.12*ASP+0.08*RPF+0.05*QC+0.05*Emb+0.10*Rib+0.05*TLoop+0.03*FFFT)+0.80*d_min(1.0,0.5+delta*0.3))*(1.0+comp_rms*0.3+diff_var*0.2)*pi_fac,-1.0,1.0);
+        double eM_psi=d_clamp(raw_psi*(0.20*UC+0.5*(1.0-d_abs(delta-0.45)/0.2))*(1.0+comp_rms*0.3+diff_var*0.2)*pi_fac,-1.0,1.0);
+        double eH_psi=d_clamp(raw_psi*(0.20*(0.05*IIT+0.05*GWT+0.05*HOT+0.05*ASP+0.03*RPF+0.25*QC+0.07*Emb+0.15*Rib+0.15*TLoop+0.10*FFFT)+0.80*d_min(1.0,delta*0.8+QC*0.2+noise_entropy*0.1))*(1.0+comp_rms*0.5+diff_var*0.4+d_abs(noise_sample)*0.1)*pi_fac,-1.0,1.0);
+        double IR=0;
+        if(enc&&enc->valid)
+            IR=d_clamp(cbs*(enc->fx*sin(eH_psi*pi_v+obs_phase)*enc->strength+enc->fy*cos(eH_psi*phi_v+noise_sample*0.1)*enc->strength+enc->fz*tanh(eH_psi+noise_entropy*enc->band_bias)*enc->strength)*enc->basin,-1.0,1.0);
+        ObsResult r;r.eL=eL_psi;r.eM=eM_psi;r.eH=eH_psi;r.IR=IR;return r;
+    }
+
+    typedef struct{double eL,eM,eH;}CFEntry;
+    typedef struct{double eL,eM,eH,IR;int N;double ne,cf_coh;}NexusResult;
+
+    static NexusResult NEXUS_tick(
+        const double *nst,int nst_len,const PsiPrev *psi_prev,
+        const double *hist_arr,int hist_len,double val_in,double aro_in,
+        const EncodedIntent *enc)
+    {
+        int N=probe_observer_count(nst_len);
+        CFEntry *cf=(CFEntry*)malloc(N*sizeof(CFEntry));
+        double eL_acc=0,eM_acc=0,eH_acc=0,IR_acc=0,ne_acc=0;
+
+    #ifdef _OPENMP
+        #pragma omp parallel reduction(+:eL_acc,eM_acc,eH_acc,IR_acc,ne_acc)
+        {
+            int tid=omp_get_thread_num();
+            #pragma omp for schedule(dynamic,16)
+            for(int obs=0;obs<N;obs++){
+                double phase=(double)obs*2.0*HB_PI/(double)N;
+                double tick=fmod(HB_GET_TIME()*1000.0+(double)(obs+1)+(double)tid*3.14159,10000.0);
+                NoiseResult nr=HB_NOISE(tick+phase,(double)(obs+1)*0.31415+(double)tid*0.7182);
+    #else
+        for(int obs=0;obs<N;obs++){
+            double phase=(double)obs*2.0*HB_PI/(double)N;
+            double tick=fmod(HB_GET_TIME()*1000.0+(double)(obs+1),10000.0);
+            NoiseResult nr=HB_NOISE(tick+phase,(double)(obs+1)*0.31415);
+    #endif
+            ne_acc+=nr.entropy/(double)N;
+            double nst_o[MAX_STATE];
+            for(int i=0;i<nst_len&&i<MAX_STATE;i++)
+                nst_o[i]=nst[i]+nr.sample*0.15*sin(phase+(double)(i+1)*HB_PHI)*exp(-(double)(i+1)*0.01);
+            ObsResult or_=run_observer(nst_o,nst_len,psi_prev,hist_arr,hist_len,val_in,aro_in,enc,phase,nr.sample,nr.entropy);
+            eL_acc+=or_.eL/(double)N;eM_acc+=or_.eM/(double)N;eH_acc+=or_.eH/(double)N;IR_acc+=or_.IR/(double)N;
+            cf[obs].eL=or_.eL;cf[obs].eM=or_.eM;cf[obs].eH=or_.eH;
+        }
+    #ifdef _OPENMP
+        }
+    #endif
+
+        int coh_N=N<512?N:512;
+        double coh=0,cf_coh=0;
+    #ifdef _OPENMP
+        #pragma omp parallel for reduction(+:coh,cf_coh) schedule(static)
+    #endif
+        for(int i=0;i<coh_N;i++)
+            for(int j=i+1;j<coh_N;j++){
+                double d=1.0-d_abs(cf[i].eH-cf[j].eH);
+                coh+=d*exp(-d_abs((double)(i-j))*0.1);
+                cf_coh+=d;
+            }
+        int pairs=coh_N*(coh_N-1)/2;
+        coh=tanh(coh/((double)coh_N*(double)coh_N+1.0));
+        cf_coh=pairs>0?cf_coh/(double)pairs:0.0;
+        free(cf);
+
+        NexusResult res;
+        res.eL=eL_acc;res.eM=eM_acc;
+        res.eH=d_clamp(eH_acc*(1.0+coh*0.3),-1.0,1.0);
+        res.IR=IR_acc;res.N=N;res.ne=ne_acc;res.cf_coh=cf_coh;
+        return res;
+    }
+
+    // Engine State
+    Target current_target;
+    EncodedIntent enc;
+    double state[32];
+    double hist[HIST_SIZE];
+    int hist_head=0, hist_count=0;
+    double psi_arr[32];
+    PsiPrev psi_p = {.arr=psi_arr,.len=32,.scalar=0,.is_scalar=0};
+    double coherence_pressure=0.0,eH_prev=0.0,val_in=0.5,aro_in=0.1;
+    long tick_num=0;
+    bool manifested=false;
+    NexusResult last_res = {0,0,0,0,0,0,0};
+
+    void init() {
+        memset(&current_target, 0, sizeof(Target));
+        strcpy(current_target.name, "Default Consensus");
+        current_target.mass_n = 0.3;
+        current_target.size_n = 0.2;
+        current_target.wavelength_n = 0.5;
+        current_target.texture_n = 0.3;
+        current_target.density_n = 0.4;
+        current_target.temp_n = 0.3;
+        current_target.solidity_n = 0.9;
+        current_target.proximity_n = 0.8;
+
+        Intent intent=target_to_intent(&current_target);
+        enc=ENCODE_INTENT(&intent);
+
+        for(int i=0;i<32;i++)state[i]=sin((double)(i+1)*HB_PHI)*0.5;
+        memset(hist,0,sizeof(hist));
+        memset(psi_arr,0,sizeof(psi_arr));
+        coherence_pressure=0.0; eH_prev=0.0; val_in=0.5; aro_in=0.1;
+        tick_num=0; manifested=false;
+    }
+
+    void update_target_from_text(const string& text) {
+        if(text.empty() || text == ":") return;
+        strncpy(current_target.name, text.c_str(), 127);
+        size_t h = hash<string>{}(text);
+        auto gv = [&](int salt) { return (double)((h ^ salt) % 1000) / 1000.0; };
+        current_target.mass_n = gv(0x123);
+        current_target.size_n = gv(0x456);
+        current_target.wavelength_n = gv(0x789);
+        current_target.texture_n = gv(0xabc);
+        current_target.density_n = gv(0xdef);
+        current_target.temp_n = gv(0xfed);
+        current_target.solidity_n = gv(0xcba);
+        current_target.proximity_n = gv(0x987);
+        Intent intent=target_to_intent(&current_target);
+        enc=ENCODE_INTENT(&intent);
+    }
+
+    void tick() {
+        if(manifested) return;
+        NexusResult r = NEXUS_tick(state, 32, &psi_p, hist, hist_count, val_in, aro_in, &enc);
+        last_res = r;
+
+        for(int i=0;i<32;i++){
+            double push=r.IR*enc.fx*sin((double)(i+1)*HB_PHI+r.eH*HB_PI)
+                       +r.IR*enc.fy*cos((double)(i+1)*HB_PHI*HB_PHI)
+                       +r.IR*enc.fz*tanh(state[i]*enc.basin);
+            double pull=r.eL*0.3*(state[i]<0?-1.0:1.0);
+            state[i]=d_clamp(state[i]+push*0.05+pull*0.02,-1.0,1.0);
+        }
+        for(int i=0;i<32;i++)psi_arr[i]=r.eH*sin((double)(i+1)*HB_PHI)*0.5;
+        hist[hist_head]=r.eL;hist_head=(hist_head+1)%HIST_SIZE;if(hist_count<HIST_SIZE)hist_count++;
+
+        double pressure_delta = d_abs(r.IR) * d_abs(r.eH) * r.cf_coh;
+        coherence_pressure = d_clamp(coherence_pressure + pressure_delta * 0.001, 0.0, 1.0);
+        aro_in=d_clamp(0.1+coherence_pressure*0.9,0.0,1.0);
+        eH_prev=r.eH;
+        tick_num++;
+
+        if(coherence_pressure >= OVERLOAD_THRESHOLD && !manifested) {
+            manifested = true;
+            // Manifestation logged in TUI
+        }
+    }
+}
+
 // ============================================================
 // CROSS-DOMAIN REASONING
 // ============================================================
@@ -825,6 +1179,7 @@ inline void tick_valence_momentum() {
 // valence_delta in [-1, 1]: user's emotional tone bleeds into Synaptic's state.
 extern "C" void receive_vocal_affect(double valence_delta) {
     push_valence(valence_delta * 0.35, 1.0);
+    HB_RXR1::val_in = HB_RXR1::d_clamp(HB_RXR1::val_in + valence_delta * 0.1, -1.0, 1.0);
 }
 WorkingMemory WM(32);
 map<string,TokenConceptEmbedding> token_concept_embedding_map;
@@ -9480,6 +9835,7 @@ static void wirePredictionVecs(const vector<string>& tokens) {
     }
 }
 string generateResponse(const string& input) {
+    HB_RXR1::update_target_from_text(input);
     string safe_input = input;
     if(safe_input.empty() || safe_input.length() > 1500)
         return "[SYNAPTIC]: ...";
@@ -11697,6 +12053,32 @@ int draw_ui(int /*unused*/) {
             tui_print(row, buf); row++;
             shown++;
         }
+    }
+
+    // ── HB-RXR1 Reality Consensus Engine ──────────────────────────────────────
+    if(row < rows_avail - 8) {
+        tui_section(row, "HB-RXR1 Reality Consensus"); row++;
+        char buf[256];
+        snprintf(buf, sizeof(buf), "  Target: %-20s  Pressure: %.4f%s",
+            HB_RXR1::current_target.name, HB_RXR1::coherence_pressure,
+            HB_RXR1::manifested ? "  !! OVERLOAD !!" : "");
+        if(HB_RXR1::manifested) attron(COLOR_PAIR(CP_ALERT) | A_BOLD | A_BLINK);
+        tui_print(row, buf); row++;
+        if(HB_RXR1::manifested) attroff(COLOR_PAIR(CP_ALERT) | A_BOLD | A_BLINK);
+
+        auto r = HB_RXR1::last_res;
+        string l_bar = tui_bar((r.eL+1.0)/2.0, 15);
+        string m_bar = tui_bar((r.eM+1.0)/2.0, 15);
+        string h_bar = tui_bar((r.eH+1.0)/2.0, 15);
+        string ir_bar= tui_bar((r.IR+1.0)/2.0, 15);
+
+        snprintf(buf, sizeof(buf), "  eL:%s  eM:%s  eH:%s  IR:%s",
+            l_bar.c_str(), m_bar.c_str(), h_bar.c_str(), ir_bar.c_str());
+        tui_print(row, buf); row++;
+
+        snprintf(buf, sizeof(buf), "  Obs:%-5d  Entropy:%.4f  CF-Coh:%.4f  Arousal:%.4f",
+            r.N, r.ne, r.cf_coh, HB_RXR1::aro_in);
+        tui_print(row, buf); row++;
     }
 
     return row;
@@ -14026,6 +14408,11 @@ int main(){
             boot_ok("Processing substrate initialised");
         }
 
+        // ── HB-RXR1 Engine initialization ─────────────────────────────────────
+        boot_info("Initializing HB-RXR1 Reality Consensus Engine");
+        HB_RXR1::init();
+        boot_ok("HB-RXR1 Engine initialized");
+
         // ── Semantic grounding bootstrap ──────────────────────────────────────
         boot_info("Bootstrapping semantic grounding system");
         try {
@@ -14069,6 +14456,8 @@ int main(){
                     try { tpGroundingPulse(); } catch(...) {}
                     // ── 4D Sensory Field tick ──────────────────────────────
                     try { sensory_field_tick(); } catch(...) {}
+                    // ── HB-RXR1 Engine tick ───────────────────────────────
+                    try { HB_RXR1::tick(); } catch(...) {}
                     if(goal_system.count("maximize_coherence")) {
                         current_plan = plan_actions(goal_system["maximize_coherence"]);
                         prune_unstable_tokens();
