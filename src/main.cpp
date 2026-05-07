@@ -47,6 +47,7 @@
 #include <sys/socket.h>
 #include <netdb.h>
 #include <arpa/inet.h>
+#include <clocale>
 using namespace std;
 
 #ifdef _OPENMP
@@ -11928,6 +11929,21 @@ int draw_ui(int /*unused*/) {
             consciousness.thalamocortical_binding,
             sentence_coherence_scores.empty() ? 0.0 : sentence_coherence_scores.back());
         tui_print(row, buf); row++;
+
+        // Phi Sparkline
+        if(!consciousness_formula.psi_history.empty()) {
+            string spark = "  \xce\xa8 hist: [";
+            int spark_len = min((int)consciousness_formula.psi_history.size(), cols - 20);
+            if(spark_len > 60) spark_len = 60;
+            for(int i = (int)consciousness_formula.psi_history.size() - spark_len; i < (int)consciousness_formula.psi_history.size(); i++) {
+                double v = max(0.0, min(1.0, consciousness_formula.psi_history[i]));
+                static const char* chars[] = {" ", "\xe2\x96\x81", "\xe2\x96\x82", "\xe2\x96\x83", "\xe2\x96\x84", "\xe2\x96\x85", "\xe2\x96\x86", "\xe2\x96\x87", "\xe2\x96\x88"};
+                int idx = (int)(v * 8);
+                spark += chars[idx];
+            }
+            spark += "]";
+            tui_printc(row, CP_ACCENT, spark); row++;
+        }
     }
 
     // ── Vocabulary / memory stats ─────────────────────────────────────────────
@@ -12110,18 +12126,39 @@ int draw_ui(int /*unused*/) {
         tui_print(row, buf); row++;
 
         auto r = HB_RXR1::last_res;
-        string l_bar = tui_bar((r.eL+1.0)/2.0, 15);
-        string m_bar = tui_bar((r.eM+1.0)/2.0, 15);
-        string h_bar = tui_bar((r.eH+1.0)/2.0, 15);
-        string ir_bar= tui_bar((r.IR+1.0)/2.0, 15);
+        string l_bar = tui_bar((r.eL+1.0)/2.0, 12);
+        string m_bar = tui_bar((r.eM+1.0)/2.0, 12);
+        string h_bar = tui_bar((r.eH+1.0)/2.0, 12);
+        string ir_bar= tui_bar((r.IR+1.0)/2.0, 12);
 
-        snprintf(buf, sizeof(buf), "  eL:%s  eM:%s  eH:%s  IR:%s",
-            l_bar.c_str(), m_bar.c_str(), h_bar.c_str(), ir_bar.c_str());
-        tui_print(row, buf); row++;
+        string bars = "  eL:" + l_bar + " eM:" + m_bar + " eH:" + h_bar + " IR:" + ir_bar;
+        tui_print(row, bars); row++;
 
         snprintf(buf, sizeof(buf), "  Obs:%-5d  Entropy:%.4f  CF-Coh:%.4f  Arousal:%.4f",
             r.N, r.ne, r.cf_coh, HB_RXR1::aro_in);
         tui_print(row, buf); row++;
+    }
+
+    // ── Thought Stream ────────────────────────────────────────────────────────
+    if(!S.internal_thoughts.empty()) {
+        tui_section(row, "Thought Stream"); row++;
+        int max_show = rows_avail - row - 2;
+        int show = min((int)S.internal_thoughts.size(), max_show);
+        for(int i = (int)S.internal_thoughts.size() - show; i < (int)S.internal_thoughts.size(); i++) {
+            if(row >= rows_avail - 1) break;
+            tui_printc(row, CP_BRIGHT, "  \xce\xbb " + S.internal_thoughts[i]); row++;
+        }
+    }
+
+    // ── Footer Help Bar ───────────────────────────────────────────────────────
+    row = rows_avail - 1;
+    {
+        string help = " [Q]uit | [S]ave | [I]nput (API) | [G]en: " + to_string(S.g) + " ";
+        string bar(cols, ' ');
+        int pad = max(0, (cols - (int)help.size()) / 2);
+        for(int i = 0; i < (int)help.size() && pad + i < cols; i++)
+            bar[pad + i] = help[i];
+        tui_printc(row, CP_TITLEBAR, bar);
     }
 
     return row;
@@ -14385,6 +14422,7 @@ int main(){
         exit(1);
     });
     signal(SIGINT, [](int){
+        endwin();
         fprintf(stdout, "\n\033[1;37m[SYNAPTIC]\033[0m Caught SIGINT — saving state...\n");
         fflush(stdout);
         try { sv("state.dat"); fprintf(stdout, "\033[1;32m[  OK  ]\033[0m State saved.\n"); } catch(...) {
@@ -14394,6 +14432,7 @@ int main(){
         exit(0);
     });
     signal(SIGTERM, [](int){
+        endwin();
         fprintf(stdout, "\n\033[1;37m[SYNAPTIC]\033[0m Caught SIGTERM — saving state...\n");
         fflush(stdout);
         try { sv("state.dat"); fprintf(stdout, "\033[1;32m[  OK  ]\033[0m State saved.\n"); } catch(...) {}
@@ -14480,12 +14519,51 @@ int main(){
         fprintf(stdout, "\033[0;37m        Press Ctrl+C to save and exit.\n\033[0m\n");
         fflush(stdout);
 
+        // ── Ncurses Initialization ───────────────────────────────────────────
+        setlocale(LC_ALL, "");
+        initscr();
+        if(has_colors()) {
+            start_color();
+            init_pair(CP_HEADER,   COLOR_CYAN,    COLOR_BLACK);
+            init_pair(CP_GOOD,     COLOR_GREEN,   COLOR_BLACK);
+            init_pair(CP_WARN,     COLOR_YELLOW,  COLOR_BLACK);
+            init_pair(CP_ALERT,    COLOR_RED,     COLOR_BLACK);
+            init_pair(CP_ACCENT,   COLOR_MAGENTA, COLOR_BLACK);
+            init_pair(CP_BRIGHT,   COLOR_WHITE,   COLOR_BLACK);
+            init_pair(CP_DIM,      COLOR_BLUE,    COLOR_BLACK);
+            init_pair(CP_TITLEBAR, COLOR_BLACK,   COLOR_CYAN);
+        }
+        cbreak();
+        noecho();
+        keypad(stdscr, TRUE);
+        nodelay(stdscr, TRUE);
+        curs_set(0);
+
         bool running = true;
         int error_count = 0;
         const int MAX_ERRORS = 10;
 
         while(running) {
             try {
+                // ── TUI Input ────────────────────────────────────────────────
+                int ch = getch();
+                if(ch == 'q' || ch == 'Q') running = false;
+                if(ch == 's' || ch == 'S') {
+                    try {
+                        sv("state.dat");
+                        S.internal_thoughts.push_back("system: manual state save triggered");
+                        if(S.internal_thoughts.size() > 10) S.internal_thoughts.erase(S.internal_thoughts.begin());
+                    } catch(...) {}
+                }
+                if(ch == 'i' || ch == 'I') {
+                    S.internal_thoughts.push_back("system: API input mode active - use Web UI or REST API");
+                    if(S.internal_thoughts.size() > 10) S.internal_thoughts.erase(S.internal_thoughts.begin());
+                }
+
+                // ── TUI Draw ─────────────────────────────────────────────────
+                erase();
+                draw_ui(0);
+                refresh();
 
                 // === VALENCE MOMENTUM TICK — must run first ===
                 tick_valence_momentum();
@@ -14563,7 +14641,8 @@ int main(){
                 if(S.g % 200 == 0) {
                     try {
                         sv("state.dat");
-                        fprintf(stdout, "\033[0;32m[autosave] Gen %d\033[0m\n", S.g);
+                        S.internal_thoughts.push_back("system: automatic state save [Gen " + to_string(S.g) + "]");
+                        if(S.internal_thoughts.size() > 10) S.internal_thoughts.erase(S.internal_thoughts.begin());
                     } catch(...) {}
                 }
 
@@ -14585,9 +14664,11 @@ int main(){
             }
         }
 
+        endwin();
         fprintf(stdout, "\033[1;37m[SYNAPTIC]\033[0m Shutdown complete.\n");
 
     } catch(const exception& e) {
+        endwin();
         fprintf(stderr, "[SYNAPTIC] Fatal: %s\n", e.what());
         try { sv("state_fatal_error.dat"); } catch(...) {}
         return 1;
