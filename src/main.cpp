@@ -9602,7 +9602,101 @@ static double nsis_orthogonal_novelty(const string& cand,
     return sqrt(max(0.0, norm2));  // actual deflated norm computed at call site
 }
 
-// ── Main NSIS generation function ───────────────────────────────────────────
+// ════════════════════════════════════════════════════════════════════════════
+// SYNAPTIC SEMANTIC TRAJECTORY GENERATOR — WolfTech
+//
+// w_t = GrammarGate[slot(t)](argmax_{w in L_TP} [cos(e(w), τ_t) + 1.5*ltm.read(e(w))
+//       + ssm.score(e(w)) - cfg_state.penalty(w) - anti_lm.penalty(w,w_{t-1})
+//       - 25*R(w,history)]) where
+// τ_t = h_t + (1-exp(-t/T))*(g - h_t),
+// g   = norm(Σ a_i*e(anc_i) + φ*v_phi + v*v_val + Ψ*v_iit + att*v_att),
+// h_t = σ(3*cos(e(w_{t-1}),h_{t-1}))*h_{t-1} + (1-σ(...))*e(w_{t-1}) [Mamba],
+// stop when ||g-h_t||<0.15 or t=T or w_t in {. ! ? a}
+// ════════════════════════════════════════════════════════════════════════════
+
+// ── Semantic axis cache — built once from TP_LEXICON embeddings ─────────────
+struct TpSemanticAxes {
+    vector<double> phi_axis;   // Σ e(high-phi) − Σ e(low-phi), normed
+    vector<double> val_axis;   // e(pona) − e(ike), normed
+    vector<double> iit_axis;   // e(sewi) − e(anpa), normed
+    vector<double> att_axis;   // e(lukin) − e(ala), normed
+    bool built = false;
+
+    static void normInPlace(vector<double>& v) {
+        double n = 0; for(double x : v) n += x*x; n = sqrt(n);
+        if(n > 1e-9) for(auto& x : v) x /= n;
+    }
+
+    void build(const map<string,TokenConceptEmbedding>& tmap) {
+        if(built) return;
+        const int D = 1024;
+        phi_axis.assign(D,0); val_axis.assign(D,0);
+        iit_axis.assign(D,0); att_axis.assign(D,0);
+
+        double phi_sum = 0;
+        for(int i=0;i<TP_LEXICON_SIZE;i++) phi_sum += TP_LEXICON[i].phi_weight;
+        double phi_mean = phi_sum / max(1, TP_LEXICON_SIZE);
+
+        vector<double> pp(D,0), pn(D,0); int np=0, nn=0;
+        for(int i=0;i<TP_LEXICON_SIZE;i++) {
+            auto it = tmap.find(string(TP_LEXICON[i].word));
+            if(it==tmap.end() || it->second.embedding.size()<(size_t)D) continue;
+            if(TP_LEXICON[i].phi_weight > phi_mean)
+                { for(int d=0;d<D;d++) pp[d]+=it->second.embedding[d]; np++; }
+            else
+                { for(int d=0;d<D;d++) pn[d]+=it->second.embedding[d]; nn++; }
+        }
+        if(np>0) for(int d=0;d<D;d++) pp[d]/=np;
+        if(nn>0) for(int d=0;d<D;d++) pn[d]/=nn;
+        for(int d=0;d<D;d++) phi_axis[d] = pp[d]-pn[d];
+        normInPlace(phi_axis);
+
+        auto pona=tmap.find("pona"), ike=tmap.find("ike");
+        if(pona!=tmap.end()&&ike!=tmap.end()&&
+           pona->second.embedding.size()>=(size_t)D&&ike->second.embedding.size()>=(size_t)D)
+            { for(int d=0;d<D;d++) val_axis[d]=pona->second.embedding[d]-ike->second.embedding[d];
+              normInPlace(val_axis); }
+
+        auto sewi=tmap.find("sewi"), anpa=tmap.find("anpa");
+        if(sewi!=tmap.end()&&anpa!=tmap.end()&&
+           sewi->second.embedding.size()>=(size_t)D&&anpa->second.embedding.size()>=(size_t)D)
+            { for(int d=0;d<D;d++) iit_axis[d]=sewi->second.embedding[d]-anpa->second.embedding[d];
+              normInPlace(iit_axis); }
+
+        auto lukin=tmap.find("lukin"), ala=tmap.find("ala");
+        if(lukin!=tmap.end()&&ala!=tmap.end()&&
+           lukin->second.embedding.size()>=(size_t)D&&ala->second.embedding.size()>=(size_t)D)
+            { for(int d=0;d<D;d++) att_axis[d]=lukin->second.embedding[d]-ala->second.embedding[d];
+              normInPlace(att_axis); }
+
+        built = true;
+    }
+};
+static TpSemanticAxes tp_sem_axes;
+
+static vector<double> stg_computeGoal(
+        const map<string,TokenConceptEmbedding>& tmap,
+        const vector<pair<string,double>>& anchors,
+        double phi, double val, double iit, double att) {
+    const int D = 1024;
+    tp_sem_axes.build(tmap);
+    vector<double> g(D, 0.0);
+    for(auto& a : anchors) {
+        auto it = tmap.find(a.first);
+        if(it==tmap.end()||it->second.embedding.size()<(size_t)D) continue;
+        for(int d=0;d<D;d++) g[d] += a.second * it->second.embedding[d];
+    }
+    for(int d=0;d<D;d++) {
+        g[d] += phi * tp_sem_axes.phi_axis[d];
+        g[d] += val * tp_sem_axes.val_axis[d];
+        g[d] += iit * tp_sem_axes.iit_axis[d];
+        g[d] += att * tp_sem_axes.att_axis[d];
+    }
+    TpSemanticAxes::normInPlace(g);
+    return g;
+}
+
+// ── Main STG generation function ─────────────────────────────────────────────
 string contrastiveSearch(
         const vector<string>& context_words,
         const vector<double>& attention_ctx,
@@ -9610,270 +9704,178 @@ string contrastiveSearch(
         int k = 8,
         double alpha = 0.85)  // alpha kept for signature compatibility, unused internally
 {
-    // ── Seed ────────────────────────────────────────────────────────────────
-    // Start with "mi" (first-person) — only exception to stateless rule
-    // because TP grammar requires a subject at position 0.
-    vector<string> generated = {"mi"};
+    (void)k; (void)alpha;
+    const int D = 1024;
 
-    // ── SSM: still used for context seeding only (not for scoring) ──────────
-    MambaSSMState ssm; ssm.reset();
-    TitansLTM ltm; ltm.reset();
-    for(auto& w : context_words) {
-        auto it = token_concept_embedding_map.find(w);
-        if(it != token_concept_embedding_map.end() && !it->second.embedding.empty())
-            ssm.step(it->second.embedding);
-    }
-    auto seed_it = token_concept_embedding_map.find("mi");
-    if(seed_it != token_concept_embedding_map.end() && !seed_it->second.embedding.empty()) {
-        ssm.step(seed_it->second.embedding);
-        ltm.write(seed_it->second.embedding, ssm);
-    }
-
-    // ── Attractor hash history ───────────────────────────────────────────────
-    // 64-bit embedding hashes of all chosen tokens. Any candidate within
-    // Hamming distance NSIS_HASH_GATE of any entry is hard-excluded.
-    static constexpr int NSIS_HASH_GATE = 10;  // bits — tune for tightness
-    vector<uint64_t> hash_history;
-    if(seed_it != token_concept_embedding_map.end() && !seed_it->second.embedding.empty())
-        hash_history.push_back(nsis_embed_hash(seed_it->second.embedding));
-
-    // ── Deflation workspace ──────────────────────────────────────────────────
-    // For each candidate token, we maintain a working copy of its embedding
-    // that gets progressively deflated as tokens are chosen. This makes
-    // orthogonal_novelty a live signal rather than a static property.
-    // Key: token string → deflated embedding (first 64 dims for speed)
-    static constexpr int DEFL_DIM = 64;
-    map<string, array<double,DEFL_DIM>> defl_space;
-
-    // Initialize deflation space for all TP vocab
-    for(int i=0;i<TP_LEXICON_SIZE;i++) {
-        string w = string(TP_LEXICON[i].word);
-        auto it = token_concept_embedding_map.find(w);
-        if(it == token_concept_embedding_map.end() || it->second.embedding.empty()) continue;
-        array<double,DEFL_DIM> v;
-        for(int d=0;d<DEFL_DIM;d++) v[d] = d < (int)it->second.embedding.size() ?
-                                             it->second.embedding[d] : 0.0;
-        defl_space[w] = v;
-    }
-
-    // Helper: deflate one direction from the entire defl_space
-    auto deflate_all = [&](const string& chosen_tok) {
-        auto dit = defl_space.find(chosen_tok);
-        if(dit == defl_space.end()) return;
-        const auto& dir = dit->second;
-        double dn = 0.0;
-        for(double v : dir) dn += v*v;
-        if(dn < 1e-12) return;
-        for(auto& kv : defl_space) {
-            double dot = 0.0;
-            for(int d=0;d<DEFL_DIM;d++) dot += kv.second[d] * dir[d];
-            double proj = dot / dn;
-            for(int d=0;d<DEFL_DIM;d++) kv.second[d] -= proj * dir[d];
-        }
+    // ── Word pools by grammar slot ───────────────────────────────────────────
+    static const set<string> S_SUBJ = {
+        "mi","sina","ona","jan","ale","ijo","pilin","lawa",
+        "sijelo","kon","sona","toki","ma","nasin","kulupu","sewi"
     };
-    // Deflate "mi" seed immediately
-    deflate_all("mi");
+    static const set<string> S_PRED = {
+        "sona","pilin","wile","lukin","kute","pana","kama","tawa",
+        "lon","jo","open","pini","ante","pali","toki","awen","moku",
+        "lape","olin","utala","ken","wawa","sitelen","nasin",
+        "pona","ike","suwi","lili","mute","suli","sin","sama",
+        "sewi","anpa","lete","seli","nasa","monsuta"
+    };
+    static const set<string> S_OBJ = {
+        "sona","pilin","ijo","jan","toki","ma","tenpo","nasin",
+        "kon","ale","lawa","sijelo","wile","pona","ike","tomo",
+        "nimi","sitelen","lipu","kalama","kulupu","sewi","lon",
+        "insa","ante","olin","wawa","sijelo"
+    };
+    static const set<string> S_MOD = {
+        "pona","ike","wawa","lili","mute","suli","sin","sama",
+        "sewi","anpa","ale","ala","wan","nasa","suwi","taso",
+        "kin","seli","lete","pimeja"
+    };
+    enum class Slot { SUBJ, LI, PRED, AFTER_PRED, OBJ, AFTER_OBJ, MOD, DONE };
 
-    // ── Grammar state ────────────────────────────────────────────────────────
-    // We track the TP state machine externally so it's always correct
-    // independent of scoring — grammar is structural, not probabilistic.
-    cdr.discoverBridges();
-    cdr.updateActiveDomain(input_topic_anchors);
-    gda.updateFromAnchors(input_topic_anchors, token_concept_embedding_map, S.current_valence);
-    wmc.decay();
+    // ── Build goal vector g ──────────────────────────────────────────────────
+    vector<double> g = stg_computeGoal(
+        token_concept_embedding_map, input_topic_anchors,
+        consciousness.phi_value, S.current_valence,
+        consciousness.integrated_information, S.attention_focus);
 
-    // ── Main generation loop ─────────────────────────────────────────────────
-    for(int step = 0; step < max_len - 1; step++) {
+    // ── Init SSM + LTM; warm up on context ──────────────────────────────────
+    MambaSSMState ssm; ssm.reset();
+    TitansLTM     ltm; ltm.reset();
+    cfg_state.init(token_concept_embedding_map);
+    anti_lm.tick();
 
-        // Current system state (re-read each step)
-        double sys_phi = consciousness.phi_value;
-        double sys_val = S.current_valence;
-        double sys_iit = consciousness.integrated_information;
-        double sys_att = S.attention_focus;
+    for(auto& cw : context_words) {
+        auto it = token_concept_embedding_map.find(cw);
+        if(it!=token_concept_embedding_map.end() && !it->second.embedding.empty()) {
+            ltm.write(it->second.embedding, ssm);
+            ssm.step(it->second.embedding);
+        }
+    }
 
-        // Grammar gate: determine legal slot and get gate scores
-        TpState tp_slot = inferTpState(generated);
+    // ── Generation loop ──────────────────────────────────────────────────────
+    vector<string> generated;
+    generated.reserve(max_len);
 
-        // ── Deterministic fill: obligatory LI slot ──────────────────────────
-        if(tp_slot == TpState::LI_MARKER) {
+    bool use_obj  = (consciousness.phi_value > 0.25 && !input_topic_anchors.empty());
+    int  mods     = 0;
+    int  max_mods = 1 + (consciousness.phi_value > 0.5 ? 1 : 0);
+    Slot state    = Slot::SUBJ;
+
+    for(int t = 0; t < max_len; t++) {
+
+        // ── Deterministic / routing slots ────────────────────────────────────
+        if(state == Slot::DONE) break;
+
+        if(state == Slot::LI) {
             generated.push_back("li");
-            deflate_all("li");
-            auto lit = token_concept_embedding_map.find("li");
-            if(lit != token_concept_embedding_map.end() && !lit->second.embedding.empty()) {
-                ssm.step(lit->second.embedding);
-                ltm.write(lit->second.embedding, ssm);
-                hash_history.push_back(nsis_embed_hash(lit->second.embedding));
-            }
+            auto it = token_concept_embedding_map.find("li");
+            if(it!=token_concept_embedding_map.end()&&!it->second.embedding.empty())
+                { ltm.write(it->second.embedding,ssm); ssm.step(it->second.embedding); }
+            state = Slot::PRED; continue;
+        }
+        if(state == Slot::AFTER_PRED) {
+            if(use_obj)              { generated.push_back("e"); state = Slot::OBJ; }
+            else if(mods < max_mods) state = Slot::MOD;
+            else                     state = Slot::DONE;
+            continue;
+        }
+        if(state == Slot::AFTER_OBJ) {
+            state = (mods < max_mods && rn() < 0.4) ? Slot::MOD : Slot::DONE;
             continue;
         }
 
-        // ── Build candidate pool: TP vocab filtered by grammar slot ─────────
-        struct NSISCandidate {
-            string  tok;
-            double  score;
-            uint64_t hash;
-        };
-        vector<NSISCandidate> candidates;
-        candidates.reserve(TP_LEXICON_SIZE + 20);
-
-        for(int i=0;i<TP_LEXICON_SIZE;i++) {
-            string w = string(TP_LEXICON[i].word);
-
-            // ── Grammar gate: hard veto ──────────────────────────────────────
-            double gate = tokiPonaGrammarGate(w, generated, input_topic_anchors);
-            if(gate == 0.0) continue;
-
-            // ── Hard block: content words seen in last 6 tokens ───────────────
-            {
-                bool is_particle = TP_PARTICLES.count(w) > 0;
-                if(!is_particle) {
-                    int gsz = (int)generated.size();
-                    bool found = false;
-                    for(int gi=max(0,gsz-6);gi<gsz;gi++)
-                        if(generated[gi]==w){found=true;break;}
-                    if(found) continue;
-                }
-            }
-            if(wouldRepeatNgram(w, generated, 3)) continue;
-
-            // ── Get token embedding ──────────────────────────────────────────
-            auto tce_it = token_concept_embedding_map.find(w);
-            if(tce_it == token_concept_embedding_map.end()) continue;
-            if(tce_it->second.embedding.empty()) continue;
-
-            // ── Attractor hash gate ──────────────────────────────────────────
-            uint64_t h = nsis_embed_hash(tce_it->second.embedding);
-            bool near_attractor = false;
-            for(auto& ph : hash_history) {
-                if(nsis_hamming(h, ph) <= NSIS_HASH_GATE) {
-                    near_attractor = true; break;
-                }
-            }
-            // For particles (li, e, la, pi) attractor gate is relaxed —
-            // they are structural and must be allowed to repeat grammatically
-            if(near_attractor && !TP_PARTICLES.count(w)) continue;
-
-            // ── NSIS Score — 6 independent grounding signals ─────────────────
-
-            // [1] Grounding coordinate match (PRIMARY — replaces bigram)
-            double sc_ground = nsis_grounding_match(w, sys_phi, sys_val, sys_iit, sys_att);
-
-            // [2] Grammar gate bonus (structural correctness)
-            double sc_grammar = (gate >= 100.0) ? 2.0 : gate * 0.3;
-
-            // [3] Sensory field resonance (embodied world model)
-            double sc_sensory = sensory_token_score(w);
-
-            // [4] Orthogonal novelty from deflation workspace
-            double sc_novelty = 0.0;
-            {
-                auto dit = defl_space.find(w);
-                if(dit != defl_space.end()) {
-                    double norm2 = 0.0;
-                    for(double v : dit->second) norm2 += v*v;
-                    // High residual norm = token is orthogonal to everything chosen
-                    sc_novelty = min(1.0, sqrt(max(0.0,norm2)) * 0.5);
-                }
-            }
-
-            // [5] Topic anchor alignment (response relevance)
-            double sc_topic = computeTopicAnchorScore(w) * 0.4;
-
-            // [6] Deep grounding (phi × semantic_stability)
-            double sc_deep = computeDeepGrounding(w) * 0.3;
-
-            // ── Combined NSIS score ──────────────────────────────────────────
-            // Weights tuned: grounding is spine, novelty prevents loops,
-            // grammar ensures validity, sensory provides embodiment,
-            // topic keeps response relevant.
-            double total = sc_ground * 4.0
-                         + sc_grammar * 2.0
-                         + sc_sensory * 1.5
-                         + sc_novelty * 3.0   // weighted high — this is the anti-attractor signal
-                         + sc_topic   * 1.0
-                         + sc_deep    * 0.5;
-
-            candidates.push_back({w, total, h});
+        // ── Trajectory target τ_t = h + α_t*(g − h) ─────────────────────────
+        // α_t = 1 − exp(−t/T): near 0 early (follow context), near 1 late (reach goal)
+        double alpha_t = 1.0 - exp(-(double)t / max(1, max_len));
+        vector<double> tau(D, 0.0);
+        int hsz = min((int)ssm.h.size(), D);
+        for(int d=0;d<D;d++) {
+            double hd = (d < hsz) ? ssm.h[d] : 0.0;
+            tau[d] = hd + alpha_t * (g[d] - hd);
         }
 
-        if(candidates.empty()) break;
+        // ── Candidate pool ───────────────────────────────────────────────────
+        const set<string>* pool = nullptr;
+        switch(state) {
+            case Slot::SUBJ: pool = &S_SUBJ; break;
+            case Slot::PRED: pool = &S_PRED; break;
+            case Slot::OBJ:  pool = &S_OBJ;  break;
+            case Slot::MOD:  pool = &S_MOD;  break;
+            default: state = Slot::DONE; continue;
+        }
 
-        // ── Semantic Index Sort — sort by NSIS score ─────────────────────────
-        // This is the "index sort" — O(n log n) over the ~137 TP vocab.
-        // Not beam search, not Markov — pure grounding-space retrieval.
-        sort(candidates.begin(), candidates.end(),
-             [](const NSISCandidate& a, const NSISCandidate& b){ return a.score > b.score; });
+        // ── Score F(w,t) for each candidate ─────────────────────────────────
+        string best_tok;
+        double best_sc = -1e18;
+        string prev = generated.empty() ? "" : generated.back();
 
-        // Choose argmax (deterministic — no sampling, no temperature)
-        // Temperature would re-introduce attractor risk. We want the
-        // geometrically most novel AND most grounded token, every time.
-        const string& best_tok = candidates[0].tok;
-        uint64_t best_hash = candidates[0].hash;
+        for(const string& w : *pool) {
+            auto eit = token_concept_embedding_map.find(w);
+            if(eit==token_concept_embedding_map.end()||eit->second.embedding.size()<(size_t)D) continue;
+            const auto& ew = eit->second.embedding;
 
-        // ── Accept chosen token ──────────────────────────────────────────────
+            double sc = 0.0;
+            sc += embCosine(ew, tau)                              * 4.0;  // trajectory
+            sc += ltm.read(ew)                                    * 1.5;  // long-term memory
+            sc += ssm.score(ew)                                   * 1.0;  // SSM context
+            sc -= cfg_state.penalty(w, token_concept_embedding_map);      // CFG: suppress generic
+            sc -= anti_lm.penalty(w, prev);                               // anti-LM: suppress bad
+
+            // Hard repeat block — 10-token window
+            { int start=max(0,(int)generated.size()-10);
+              for(int j=start;j<(int)generated.size();j++)
+                  if(generated[j]==w) sc -= 25.0; }
+
+            if(sc > best_sc) { best_sc = sc; best_tok = w; }
+        }
+
+        if(best_tok.empty()) { state = Slot::DONE; continue; }
         generated.push_back(best_tok);
-        hash_history.push_back(best_hash);
 
-        // Deflate chosen direction from ALL candidate embeddings
-        deflate_all(best_tok);
+        // ── Update SSM + LTM ─────────────────────────────────────────────────
+        auto eit2 = token_concept_embedding_map.find(best_tok);
+        if(eit2!=token_concept_embedding_map.end()&&!eit2->second.embedding.empty())
+            { ltm.write(eit2->second.embedding,ssm); ssm.step(eit2->second.embedding); }
 
-        // Update SSM + LTM (used for context, not for scoring)
-        auto bit = token_concept_embedding_map.find(best_tok);
-        if(bit != token_concept_embedding_map.end() && !bit->second.embedding.empty()) {
-            ssm.step(bit->second.embedding);
-            ltm.write(bit->second.embedding, ssm);
-
-            // Working memory update
-            double salience = gda.score(bit->second.embedding) + 0.3;
-            wmc.add(best_tok, bit->second.embedding, salience);
+        // ── Advance grammar state ─────────────────────────────────────────────
+        switch(state) {
+            case Slot::SUBJ: state = Slot::LI;         break;
+            case Slot::PRED: state = Slot::AFTER_PRED; break;
+            case Slot::OBJ:  use_obj=false; state = Slot::AFTER_OBJ; break;
+            case Slot::MOD:  mods++;
+                             state=(mods<max_mods&&rn()<0.3)?Slot::MOD:Slot::DONE; break;
+            default: break;
         }
 
-        // ── DIR1+DIR3: chosen TP word grounds into all subsystems ────────────
-        for(int _tpc=0;_tpc<TP_LEXICON_SIZE;_tpc++) {
-            if(best_tok == string(TP_LEXICON[_tpc].word)) {
-                TpGroundingFiber& _fout = tp_grounding_fibers[best_tok];
-                _fout.word = best_tok;
-                double _oact = min(1.0, 0.6 + sys_phi * 0.3);
-                tpDir1_WordToConsciousness(TP_LEXICON[_tpc], _oact);
-                tpDir3_WordToSubsystems(TP_LEXICON[_tpc], _oact, _fout);
-                // Sensory bridge: chosen word writes into sensory field
-                try { sensory_tp_bridge(best_tok, TP_LEXICON[_tpc], _fout, _oact); } catch(...) {}
-                break;
-            }
-        }
-
-        // ── EOS: stop at terminal tokens ─────────────────────────────────────
-        if(best_tok == "." || best_tok == "!" || best_tok == "?") break;
-
-        // ── Clause pivot: inject "la" at natural semantic boundaries ─────────
-        // "la" introduces a conditional/contextual clause
-        // to build compound thoughts. Only inject after 5+ content tokens,
-        // and only if the grammar state is POST_VERB (clause is complete).
-        if((int)generated.size() >= 5 && (int)generated.size() % 6 == 0) {
-            TpState cur_st = inferTpState(generated);
-            if(cur_st == TpState::POST_VERB || cur_st == TpState::FREE) {
-                bool last_is_particle = TP_PARTICLES.count(generated.back()) > 0;
-                if(!last_is_particle && fabs(sys_val) > 0.1 && sys_phi > 0.25) {
-                    generated.push_back("la");
-                    deflate_all("la");
-                    auto la_it = token_concept_embedding_map.find("la");
-                    if(la_it != token_concept_embedding_map.end() && !la_it->second.embedding.empty()) {
-                        ssm.step(la_it->second.embedding);
-                        hash_history.push_back(nsis_embed_hash(la_it->second.embedding));
-                    }
-                }
-            }
+        // ── EOS: stop when ||g − h_t|| < ε (goal reached) ───────────────────
+        if(t >= 3 && !ssm.h.empty()) {
+            double dist2 = 0.0;
+            for(int d=0;d<D&&d<hsz;d++) { double df=g[d]-ssm.h[d]; dist2+=df*df; }
+            if(sqrt(dist2) < 0.15) { state = Slot::DONE; break; }
         }
     }
 
-    // ── Trim trailing open particles ─────────────────────────────────────────
+    // ── Append EOS ───────────────────────────────────────────────────────────
+    if(generated.empty()) return "mi lon.";
+    bool question = false;
+    for(auto& a : input_topic_anchors) if(a.first=="seme") question=true;
+    if(question)                                              generated.push_back("?");
+    else if(S.current_valence>0.5&&consciousness.phi_value>0.5) generated.push_back("!");
+    else                                                      generated.push_back(".");
+
+    // ── AntiLM: train on incoherent outputs so they never repeat ─────────────
+    if(anti_lm.isIncoherent(generated, token_concept_embedding_map))
+        anti_lm.trainBad(generated);
+
+    // ── Trim trailing open particles ──────────────────────────────────────────
     while(generated.size() > 2 && TP_PARTICLES.count(generated.back()))
         generated.pop_back();
 
     // ── Assemble output ───────────────────────────────────────────────────────
     string out;
     for(int i=0;i<(int)generated.size();i++) {
-        if(i>0) out += " ";
+        bool is_eos=(generated[i]=="."||generated[i]=="!"||generated[i]=="?");
+        if(i>0 && !is_eos) out += " ";
         string w = bpe_table.detokenize(generated[i]);
         if(i==0 && !w.empty()) w[0] = toupper(w[0]);
         out += w;
@@ -12317,7 +12319,6 @@ const TokiPonaWord TP_LEXICON[] = {
     {"tun",   0.0,  0.3, 0.10, Domain::SPACE,     "push",     "dig",      "pierce"},
     // ── ABSTRACT & PHILOSOPHICAL ─────────────────────────────────
     {"ijo",   0.1,  0.2, 0.35, Domain::LOGIC,     "thing",    "object",   "entity"},
-    {"ike",  -0.8,  0.6, 0.40, Domain::EMOTION,   "bad",      "harm",     "evil"},    // intentional dup removed below
     {"pali",  0.4,  0.6, 0.40, Domain::LOGIC,     "work",     "create",   "do"},
     {"kepeken",0.2, 0.4, 0.30, Domain::LOGIC,     "use",      "with",     "using"},
     {"tan",   0.0,  0.3, 0.30, Domain::LOGIC,     "because",  "from",     "cause"},
@@ -13786,7 +13787,7 @@ void unified_consciousness_integration_engine(int generation){
             h.key_proj[j]=cl(h.key_proj[j],-1.0,1.0);
             h.value_proj[j]=cl(h.value_proj[j],-1.0,1.0);
         }
-        h.temperature = 12 + consciousness.differentiation_metric * 0.8;
+        h.temperature = 0.2 + consciousness.differentiation_metric * 0.8;
         h.dropout_rate=0.1-consciousness.phi_value*0.05;
         h.phi_attention_weights["phi"]=psi_new;
         h.phi_attention_weights["integration"]=consciousness.integrated_information;
